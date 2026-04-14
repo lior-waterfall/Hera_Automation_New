@@ -1,0 +1,25 @@
+# ─── Secrets & Credentials ───────────────────────────────────────────────────
+.env
+*.pem
+*.key
+*.pfx
+*.p12
+
+# ─── Sensitive Runtime Files ──────────────────────────────────────────────────
+load_test.ini
+ips.json
+
+# ─── Terraform ────────────────────────────────────────────────────────────────
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+*.tfplan
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

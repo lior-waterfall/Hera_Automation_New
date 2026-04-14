@@ -1,0 +1,31 @@
+{
+    "project_namespace": "TIKAL",
+
+    "client_assets_factor": 1,
+    "client_username": "Administrator",
+    "client_pass": "CHANGE_ME",
+
+    "server_pass": "CHANGE_ME",
+
+    "account_pass": "CHANGE_ME",
+    "account_first_name": "CHANGE_ME",
+    "account_last_name": "CHANGE_ME",
+    "account_email_user": "CHANGE_ME",
+    "account_email_domain": "CHANGE_ME",
+
+    "asset_name": "CHANGE_ME",
+    "asset_user": "CHANGE_ME",
+    "asset_pass": "CHANGE_ME",
+    "asset_protocol": "rdp",
+    "asset_port": 3389,
+
+    "mtls_issue_sleep_time": 5,
+
+    "projects": {
+        "TIKAL": {
+            "server_ip": "80.179.187.186",
+            "api_port": 31643,
+            "mtls_port": 31888
+        }
+    }
+}
