@@ -250,7 +250,7 @@ def run_client_login(max_assets=None):
 
     def get_login_command(counter, asset_ip):
         return (
-            f'psexec -i 2 -d '
+            f'psexec -i 1 /accepteula -d '
             f'"C:\\Program Files\\hera-client\\tauri-client-app.exe" '
             f'--auto-login={settings["account_email_user"]}{counter}@{settings["account_email_domain"]}:{settings["account_pass"]}@{settings["server_ip"]} '
             f'--url=http://hera-hera-web:3000/hera-web?auto_connect={settings["asset_user"]}:{settings["asset_encoded_pass"]}@{settings["asset_name"]}-{counter} '
