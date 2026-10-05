@@ -1,11 +1,14 @@
 import configparser
 import os
 import paramiko
+import socket
 import subprocess
 import json
 import time
 import math
 from urllib.parse import quote
+from server_cleanup import asset_display_name, erase_web_user_and_asset
+from tx_cert_upload import delete_tx_certificate, export_client_tx_certificate, tx_upload_configured, upload_tx_certificate
 
 # Configuration
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -62,6 +65,14 @@ def _read_load_test_settings():
             "mtls_port": int(os.environ.get(f'{project_namespace}_MTLS_PORT', '0')),
             "mtls_issue_sleep_time": int(os.environ.get('MTLS_ISSUE_SLEEP_TIME', '9')),
             "admin_credentials": os.environ.get('ADMIN_CREDENTIALS', ''),
+            "api_scheme": os.environ.get('API_SCHEME', 'https'),
+            "tx_host": os.environ.get('TX_HOST', ''),
+            "tx_ssh_user": os.environ.get('TX_SSH_USER', ''),
+            "tx_ssh_pass": os.environ.get('TX_SSH_PASS', ''),
+            "tx_ssh_key": os.environ.get('TX_SSH_KEY', ''),
+            "tx_ssh_port": int(os.environ.get('TX_SSH_PORT', '22')),
+            "tx_cert_folder": os.environ.get('TX_CERT_FOLDER', ''),
+            "tx_rehash_command": os.environ.get('TX_REHASH_COMMAND', ''),
         }
 
     return load_test_settings_cache
@@ -94,7 +105,20 @@ def _get_terraform_ips():
         return [], []
 
 
-def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seconds=None):
+def _read_remote_command(stdout, stderr, timeout_seconds=None):
+    channel = stdout.channel
+    if timeout_seconds:
+        channel.settimeout(timeout_seconds)
+    try:
+        output = stdout.read().decode('utf-8', errors='replace')
+        error_output = stderr.read().decode('utf-8', errors='replace')
+        return output, error_output, channel.recv_exit_status(), False
+    except socket.timeout:
+        channel.close()
+        return "", "timed out waiting for the Windows command", -1, True
+
+
+def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seconds=None, on_success=None, command_timeout=None):
     """Execute a Tauri command against each client machine using Paramiko."""
     global load_test_counter
     sleep_seconds = sleep_seconds if sleep_seconds is not None else 1
@@ -153,18 +177,27 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                     print(f"    - Executing for asset {asset_ip}: {tauri_command}")
 
                     stdin, stdout, stderr = ssh_client.exec_command(tauri_command)
-                    exit_status = stdout.channel.recv_exit_status()
+                    output, error_output, exit_status, timed_out = _read_remote_command(stdout, stderr, command_timeout)
+                    if timed_out:
+                        print("    - Windows command timed out. Closing the Hera window so teardown can continue.")
+                        print("    - The installed client does not support --delete-account yet, so the local account was not erased.")
+                        kill_stdin, kill_stdout, kill_stderr = ssh_client.exec_command('taskkill /F /IM tauri-client-app.exe')
+                        _read_remote_command(kill_stdout, kill_stderr, 10)
+                        assets_processed += 1
+                        continue
 
                     # psexec -d returns a Process ID (positive integer) rather than 0.
                     is_detach = "psexec" in tauri_command and "-d" in tauri_command
                     
                     if exit_status == 0 or (is_detach and exit_status > 0):
+                        if on_success and not on_success(load_test_counter, asset_ip, output, client_ip):
+                            print(f"    - Setup command succeeded, but the TX certificate was not uploaded for asset {asset_ip}.")
                         print(f"    - Success! (Exit Code / PID: {exit_status})")
                         assets_processed += 1
                     else:
                         print(f"    - Error executing command for asset {asset_ip}.")
                         print(f"    - Exit Code: {exit_status}")
-                        print(f"    - Stderr: {stderr.read().decode('utf-8')}")
+                        print(f"    - Stderr: {error_output}")
                         assets_processed += 1
                         print(f"  - Sleep for {sleep_seconds} seconds to let mtls recover from the previous execution.")
                         time.sleep(sleep_seconds)
@@ -206,10 +239,24 @@ def run_client_setup():
             f'--admin-credentials={settings["admin_credentials"]} '
             f'--setup-account={settings["account_first_name"]}:{settings["account_last_name"]}:{settings["account_email_user"]}{counter}@{settings["account_email_domain"]}@{settings["server_ip"]}:{settings["account_pass"]} '
             f'--setup-assets={settings["asset_name"]}-{counter}:{settings["asset_protocol"]}:{asset_ip}:{settings["asset_port"]}:{settings["asset_pass"]} '
-            f'--api-port={settings["api_port"]}'
+            f'--api-port={settings["api_port"]} '
+            f'--mtls-port={settings["mtls_port"]}'
         )
 
-    _execute_on_clients(get_setup_command, settings)
+    def upload_setup_certificate(counter, asset_ip, output, client_ip):
+        if not tx_upload_configured(settings):
+            print("    - TX upload skipped: set TX_HOST and TX_CERT_FOLDER to copy the External IP certificate.")
+            return True
+        email = f'{settings["account_email_user"]}{counter}@{settings["account_email_domain"]}'
+        try:
+            certificate = export_client_tx_certificate(settings, client_ip, email)
+            upload_tx_certificate(settings, email, certificate)
+            return True
+        except Exception as exc:
+            print(f"    - Failed to upload TX certificate for {email} after asset {asset_ip}: {exc}")
+            return False
+
+    _execute_on_clients(get_setup_command, settings, on_success=upload_setup_certificate)
 
 
 def run_client_teardown():
@@ -223,17 +270,21 @@ def run_client_teardown():
         return
 
     def get_teardown_command(counter, asset_ip):
-        # NOTE: Replace '--delete-account' with your actual Tauri CLI flag for user deletion
-        return (
-            f'cd "C:\\Program Files\\hera-client" && '
-            f'tauri-client-app.exe '
-            f'--admin-credentials={settings["admin_credentials"]} '
-            f'--delete-account={settings["account_email_user"]}{counter}@{settings["account_email_domain"]} '
-            f'--api-port={settings["api_port"]}'
-        )
+        email = f'{settings["account_email_user"]}{counter}@{settings["account_email_domain"]}'
+        print(f"    - Erasing web user, asset, and TX certificate for {email}")
+        try:
+            erase_web_user_and_asset(settings, email, asset_display_name(settings, counter), asset_ip)
+        except Exception as exc:
+            print(f"    - Failed to erase web user or asset for {email}: {exc}")
+        try:
+            delete_tx_certificate(settings, email)
+        except Exception as exc:
+            print(f"    - Failed to erase TX certificate for {email}: {exc}")
+        print("    - Local Windows account was not erased. That step needs the new client.")
+        return "echo local-delete-skipped"
 
     try:
-        _execute_on_clients(get_teardown_command, settings)
+        _execute_on_clients(get_teardown_command, settings, command_timeout=45)
     finally:
         load_test_counter = 0
 
@@ -255,6 +306,7 @@ def run_client_login(max_assets=None):
             f'--auto-login={settings["account_email_user"]}{counter}@{settings["account_email_domain"]}:{settings["account_pass"]}@{settings["server_ip"]} '
             f'--url=http://hera-hera-web:3000/hera-web?auto_connect={settings["asset_user"]}:{settings["asset_encoded_pass"]}@{settings["asset_name"]}-{counter} '
             f'--api-port={settings["api_port"]} '
+            f'--mtls-port={settings["mtls_port"]} '
         )
 
     try:

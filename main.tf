@@ -15,19 +15,19 @@ provider "aws" {
 variable "region" {
   description = "AWS region"
   type        = string
-  default     = "eu-central-1"
+  default     = "il-central-1"
 }
 
 variable "ami_id_client" {
   description = "AMI ID for client instances"
   type        = string
-  default     = "ami-066443b0b8e6e2058"
+  default     = "ami-0f67489dd0a00f820"
 }
 
 variable "ami_id_asset" {
   description = "AMI ID for asset instances"
   type        = string
-  default     = "ami-0916617956d59d651"
+  default     = "ami-0c127efdb9ca2ee94"
 }
 
 variable "instance_type_client" {
@@ -51,7 +51,7 @@ variable "key_name" {
 variable "security_group_ids" {
   description = "Security group IDs for instances"
   type        = list(string)
-  default     = ["sg-02e7f1452c2ac4207"]
+  default     = ["sg-07dc4063adf319b5b"]
 }
 
 variable "client_instance_count" {
@@ -66,9 +66,15 @@ variable "asset_instance_count" {
   default     = 1
 }
 
+variable "client_mtls_port" {
+  description = "MTLS port for the client application"
+  type        = string
+  default     = "30888"
+}
+
 # Create a dynamic Security Group in the current region
 resource "aws_security_group" "hera_sg" {
-  name        = "hera_security_group"
+  name        = "hera_security_group_lt"
   description = "Allow inbound traffic for Hera instances"
 
   # RDP access for Windows
@@ -117,6 +123,8 @@ resource "aws_instance" "clients" {
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "AutoAdminLogon" -Value "1"
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "DefaultUserName" -Value $Username
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "DefaultPassword" -Value $Password
+    
+    [System.Environment]::SetEnvironmentVariable("HERA_MTLS_PORT", "${var.client_mtls_port}", "Machine")
     </powershell>
   EOF
 }
