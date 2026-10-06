@@ -1,3 +1,4 @@
+import base64
 import configparser
 import os
 import paramiko
@@ -118,6 +119,56 @@ def _read_remote_command(stdout, stderr, timeout_seconds=None):
         return "", "timed out waiting for the Windows command", -1, True
 
 
+def _wait_for_local_mtls_proxy(ssh_client, timeout_seconds=30):
+    command = (
+        'powershell -NoProfile -NonInteractive -Command '
+        f'"$deadline=(Get-Date).AddSeconds({int(timeout_seconds)}); '
+        'while ((Get-Date) -lt $deadline) { '
+        'if (Get-NetTCPConnection -LocalPort 5555 -State Listen -ErrorAction SilentlyContinue) { exit 0 }; '
+        'Start-Sleep -Seconds 1 }; exit 1"'
+    )
+    _stdin, stdout, stderr = ssh_client.exec_command(command)
+    _output, _error_output, exit_status, timed_out = _read_remote_command(
+        stdout, stderr, timeout_seconds + 5
+    )
+    return not timed_out and exit_status == 0
+
+
+def _stop_client_process_tree(ssh_client, process_id):
+    _stdin, stdout, stderr = ssh_client.exec_command(
+        f"taskkill /PID {int(process_id)} /T /F"
+    )
+    _read_remote_command(stdout, stderr, 10)
+
+
+def _execute_login_with_proxy_retry(ssh_client, command):
+    for attempt in range(2):
+        _stdin, stdout, stderr = ssh_client.exec_command(command)
+        output, error_output, exit_status, timed_out = _read_remote_command(
+            stdout, stderr, 20
+        )
+        if timed_out:
+            return output, error_output, exit_status, timed_out
+        if exit_status < 0:
+            return output, error_output, exit_status, False
+        if _wait_for_local_mtls_proxy(ssh_client):
+            return output, error_output, exit_status, False
+
+        if attempt == 0 and exit_status > 0:
+            print("    - Local mTLS proxy did not start; restarting Tauri once.")
+            _stop_client_process_tree(ssh_client, exit_status)
+            time.sleep(2)
+            continue
+
+        message = "TpmMtlsProxy did not listen on 127.0.0.1:5555."
+        if attempt > 0:
+            message = "TpmMtlsProxy did not listen on 127.0.0.1:5555 after retry."
+        error_output = f"{error_output}\n{message}".strip()
+        return output, error_output, -1, False
+
+    return "", "TpmMtlsProxy did not listen on 127.0.0.1:5555.", -1, False
+
+
 def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seconds=None, on_success=None, command_timeout=None):
     """Execute a Tauri command against each client machine using Paramiko."""
     global load_test_counter
@@ -137,7 +188,7 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
         return
 
     # If factor is 0, distribute assets evenly across clients (ceil to cover remainders).
-    client_assets_factor = settings["client_assets_factor"]
+    client_assets_factor = settings["client_assets_factor"] # From environment variable
     if client_assets_factor == 0:
         client_assets_factor = math.ceil(len(asset_ips) / len(client_ips))
 
@@ -170,17 +221,25 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                     break
                 try:
                     load_test_counter += 1
-                    asset_ip = next(asset_ip_iter)
+                    asset_ip = next(asset_ip_iter)# Take the next asset IP from the iterator
 
                     tauri_command = get_tauri_command(load_test_counter, asset_ip)
 
-                    print(f"    - Executing for asset {asset_ip}: {tauri_command}")
+                    print(f"    - Executing command for asset {asset_ip} on client {client_ip}.")
 
-                    stdin, stdout, stderr = ssh_client.exec_command(tauri_command)
-                    output, error_output, exit_status, timed_out = _read_remote_command(stdout, stderr, command_timeout)
+                    is_client_login = "psexec" in tauri_command and "--auto-login=" in tauri_command
+                    if is_client_login:
+                        output, error_output, exit_status, timed_out = _execute_login_with_proxy_retry(
+                            ssh_client, tauri_command
+                        )
+                    else:
+                        stdin, stdout, stderr = ssh_client.exec_command(tauri_command)
+                        output, error_output, exit_status, timed_out = _read_remote_command(
+                            stdout, stderr, command_timeout
+                        )
                     if timed_out:
                         print("    - Windows command timed out. Closing the Hera window so teardown can continue.")
-                        print("    - The installed client does not support --delete-account yet, so the local account was not erased.")
+                        print("    - The local Tauri account may not have been deleted.")
                         kill_stdin, kill_stdout, kill_stderr = ssh_client.exec_command('taskkill /F /IM tauri-client-app.exe')
                         _read_remote_command(kill_stdout, kill_stderr, 10)
                         assets_processed += 1
@@ -188,8 +247,14 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
 
                     # psexec -d returns a Process ID (positive integer) rather than 0.
                     is_detach = "psexec" in tauri_command and "-d" in tauri_command
+                    is_account_delete = "--delete-account=" in tauri_command
+                    command_succeeded = exit_status == 0 or (is_detach and exit_status > 0)
+                    if is_account_delete and "ACCOUNT_DELETE_SUCCESSFUL" not in output:
+                        command_succeeded = False
                     
-                    if exit_status == 0 or (is_detach and exit_status > 0):
+                    if command_succeeded:
+                        if is_account_delete:
+                            print(f"    - {output.strip()}")
                         if on_success and not on_success(load_test_counter, asset_ip, output, client_ip):
                             print(f"    - Setup command succeeded, but the TX certificate was not uploaded for asset {asset_ip}.")
                         print(f"    - Success! (Exit Code / PID: {exit_status})")
@@ -198,6 +263,8 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                         print(f"    - Error executing command for asset {asset_ip}.")
                         print(f"    - Exit Code: {exit_status}")
                         print(f"    - Stderr: {error_output}")
+                        if is_account_delete and "ACCOUNT_DELETE_SUCCESSFUL" not in output:
+                            print("    - Delete success marker was not returned by the client.")
                         assets_processed += 1
                         print(f"  - Sleep for {sleep_seconds} seconds to let mtls recover from the previous execution.")
                         time.sleep(sleep_seconds)
@@ -244,7 +311,7 @@ def run_client_setup():
         )
 
     def upload_setup_certificate(counter, asset_ip, output, client_ip):
-        if not tx_upload_configured(settings):
+        if not tx_upload_configured(settings): # Just check if TX folder is configured
             print("    - TX upload skipped: set TX_HOST and TX_CERT_FOLDER to copy the External IP certificate.")
             return True
         email = f'{settings["account_email_user"]}{counter}@{settings["account_email_domain"]}'
@@ -280,13 +347,77 @@ def run_client_teardown():
             delete_tx_certificate(settings, email)
         except Exception as exc:
             print(f"    - Failed to erase TX certificate for {email}: {exc}")
-        print("    - Local Windows account was not erased. That step needs the new client.")
-        return "echo local-delete-skipped"
+        return (
+            f'"C:\\Program Files\\hera-client\\tauri-client-app.exe" '
+            f'--delete-account="{email}"'
+        )
 
     try:
         _execute_on_clients(get_teardown_command, settings, command_timeout=45)
     finally:
         load_test_counter = 0
+        run_client_close()
+
+
+def run_client_close():
+    """Close Tauri and its child processes without deleting accounts or certificates."""
+    try:
+        settings = _read_load_test_settings()
+    except Exception as exc:
+        print(f"Could not load test settings: {exc}")
+        return
+
+    client_ips, _asset_ips = _get_terraform_ips()
+    if not client_ips:
+        print("Could not close client apps without client IPs from Terraform.")
+        return
+
+    close_script = (
+        "$ErrorActionPreference='Stop'; "
+        "$processes=@(Get-CimInstance Win32_Process | Where-Object { "
+        "$_.Name -in @('tauri-client-app.exe','TpmMtlsProxy.exe') }); "
+        "if ($processes.Count -eq 0) { Write-Output 'No Tauri client app running'; exit 0 }; "
+        "foreach ($process in $processes) { "
+        "Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "Start-Sleep -Seconds 1; "
+        "$remaining=@(Get-CimInstance Win32_Process | Where-Object { "
+        "$_.Name -in @('tauri-client-app.exe','TpmMtlsProxy.exe') }); "
+        "if ($remaining.Count -gt 0) { "
+        "Write-Output ('Processes still running: ' + (($remaining | ForEach-Object Name) -join ', ')); exit 1 }; "
+        "Write-Output 'Closed Tauri client and child processes'; exit 0"
+    )
+    encoded_script = base64.b64encode(close_script.encode("utf-16le")).decode("ascii")
+    command = f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded_script}"
+
+    for client_ip in client_ips:
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            print(f"\nClosing Tauri client on {client_ip}...")
+            ssh_client.connect(
+                hostname=client_ip,
+                username=settings["client_username"],
+                password=settings["client_pass"],
+                timeout=10,
+            )
+            _stdin, stdout, stderr = ssh_client.exec_command(command)
+            output, error_output, exit_status, timed_out = _read_remote_command(
+                stdout, stderr, 20
+            )
+            if timed_out:
+                print(f"  - Timed out closing Tauri on {client_ip}.")
+            elif exit_status == 0:
+                print(f"  - {output.strip()}")
+            else:
+                print(f"  - Failed to close Tauri on {client_ip}: {error_output.strip() or output.strip()}")
+        except paramiko.AuthenticationException:
+            print(f"  - Authentication failed for {client_ip}.")
+        except paramiko.SSHException as exc:
+            print(f"  - SSH connection error for {client_ip}: {exc}")
+        except Exception as exc:
+            print(f"  - Could not close Tauri on {client_ip}: {exc}")
+        finally:
+            ssh_client.close()
 
 
 def run_client_login(max_assets=None):
@@ -330,8 +461,9 @@ def main():
         print("\nLoad Test Executor")
         print("1. Run client setup (load test)")
         print("2. Run client login (load test)")
-        print("3. Run client teardown (delete accounts)")
-        print("4. Exit")
+        print("3. Close client apps (keep users and certificates)")
+        print("4. Run client teardown (delete accounts)")
+        print("5. Exit")
         
         choice = input("Enter your choice: ")
         
@@ -351,8 +483,10 @@ def main():
                     run_client_login()
                     break
         elif choice == '3':
-            run_client_teardown()
+            run_client_close()
         elif choice == '4':
+            run_client_teardown()
+        elif choice == '5':
             confirm = input("Do you want to delete the created test users before exiting? (y/n): ").strip().lower()
             if confirm in ('y', 'yes'):
                 run_client_teardown()

@@ -115,7 +115,9 @@ python3 load_test.py
 ### Script Menu Options:
 * **Option 1 (Run client setup)**: Connects to Windows clients via SSH and runs Tauri CLI commands to register accounts and map assets on the Hera server. If `TX_HOST` and `TX_CERT_FOLDER` are set in `.env`, it also copies the HERA External IP certificate into that TX mTLS folder and rehashes the folder. `TX_CERT_FOLDER` is the folder shown after the one-time SSL Apply. Also set `TX_SSH_USER` and either `TX_SSH_PASS` or `TX_SSH_KEY`.
 * **Option 2 (Run client login)**: Launches `tauri-client-app.exe` headlessly inside RDP session 2 using `psexec` with `--auto-login` and `--url` parameters.
-* **Option 3 (Run client teardown)**: Deletes the generated test accounts from the Hera server.
+* **Option 3 (Close client apps)**: Closes Tauri and its child mTLS proxy processes on all clients while keeping Hera users, assets, and certificates intact. Use this before running login again.
+* **Option 4 (Run client teardown)**: Deletes the generated test accounts and assets, removes TX certificates, deletes local Tauri accounts, then closes any remaining client apps.
+* **Option 5 (Exit)**: Exits the menu; optionally runs teardown before exiting.
 
 ---
 
