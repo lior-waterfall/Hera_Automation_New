@@ -1,5 +1,6 @@
 """Copy a HERA External IP (TX) certificate into a TX mTLS folder."""
 
+import base64
 import os
 import posixpath
 import re
@@ -77,7 +78,7 @@ def tx_upload_configured(settings):
     return bool(settings.get("tx_host") and settings.get("tx_cert_folder"))
 
 
-def export_client_tx_certificate(settings, client_ip, email):
+def export_client_tx_certificate(settings, client_ip, email, execute=None):
     """Export the newest public .tx certificate for this account from the Windows client."""
     safe_email = (email or "").replace("'", "")
     if not safe_email:
@@ -95,31 +96,41 @@ def export_client_tx_certificate(settings, client_ip, email):
         "Write-Output '-----END CERTIFICATE-----'\n"
         "Write-Output ('SUBJECT=' + $cert.Subject)\n"
     )
-    remote_script = r"C:\Users\Administrator\export-tx-cert.ps1"
-    ssh_client = paramiko.SSHClient()
-    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh_client.connect(
-        hostname=client_ip,
-        username=settings["client_username"],
-        password=settings["client_pass"],
-        timeout=20,
-    )
-    try:
-        sftp = ssh_client.open_sftp()
-        try:
-            with sftp.file(remote_script, "w") as remote_file:
-                remote_file.write(script)
-        finally:
-            sftp.close()
-        _stdin, stdout, stderr = ssh_client.exec_command(
-            "powershell -NoProfile -ExecutionPolicy Bypass -File " + remote_script
+    if execute:
+        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        command = [
+            "powershell.exe", "-NoProfile", "-NonInteractive",
+            "-EncodedCommand", encoded_script,
+        ]
+        output, error_output, exit_status, timed_out = execute(command, 30)
+        if timed_out:
+            raise RuntimeError(f"Timed out exporting the TX certificate for {email}")
+    else:
+        remote_script = r"C:\Users\Administrator\export-tx-cert.ps1"
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(
+            hostname=client_ip,
+            username=settings["client_username"],
+            password=settings["client_pass"],
+            timeout=20,
         )
-        output = stdout.read().decode("utf-8", errors="replace")
-        error_output = stderr.read().decode("utf-8", errors="replace")
-        exit_status = stdout.channel.recv_exit_status()
-        ssh_client.exec_command(f'del /f /q "{remote_script}"')
-    finally:
-        ssh_client.close()
+        try:
+            sftp = ssh_client.open_sftp()
+            try:
+                with sftp.file(remote_script, "w") as remote_file:
+                    remote_file.write(script)
+            finally:
+                sftp.close()
+            _stdin, stdout, stderr = ssh_client.exec_command(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File " + remote_script
+            )
+            output = stdout.read().decode("utf-8", errors="replace")
+            error_output = stderr.read().decode("utf-8", errors="replace")
+            exit_status = stdout.channel.recv_exit_status()
+            ssh_client.exec_command(f'del /f /q "{remote_script}"')
+        finally:
+            ssh_client.close()
 
     if exit_status != 0 or "BEGIN CERTIFICATE" not in output:
         details = (error_output or output).strip() or f"exit {exit_status}"

@@ -72,6 +72,12 @@ variable "client_mtls_port" {
   default     = "30888"
 }
 
+variable "client_password" {
+  description = "Administrator password for client instances"
+  type        = string
+  sensitive   = true
+}
+
 # Create a dynamic Security Group in the current region
 resource "aws_security_group" "hera_sg" {
   name        = "hera_security_group_lt"
@@ -117,7 +123,7 @@ resource "aws_instance" "clients" {
   // Auto-login configuration for Windows instances
   user_data = <<-EOF
     <powershell>
-    $Password = "T6H)ejHYULYtLo4EXfXpoo8h!)VCy4ZT"
+    $Password = "${var.client_password}"
     $Username = "Administrator"
     
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "AutoAdminLogon" -Value "1"

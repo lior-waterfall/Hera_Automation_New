@@ -67,10 +67,10 @@ aws sts get-caller-identity
 ```
 
 ### 3. Python 3 & Dependencies
-Ensure Python 3.8+ and the SSH library `paramiko` are installed:
+Ensure Python 3.8+ and the `paramiko` and `requests` libraries are installed:
 ```bash
 sudo dnf install -y python3 python3-pip
-pip3 install paramiko
+pip3.12 install paramiko requests
 ```
 
 ---
@@ -83,11 +83,17 @@ cp .env.example .env
 ```
 
 Open `.env` and fill in your environment parameters:
-* `CLIENT_ASSETS_FACTOR`: Set to `0` to distribute assets evenly among client machines.
-* `CLIENT_PASS` & `CLIENT_USERNAME`: RDP/SSH credentials for the Windows clients.
+* `CLIENT_ASSETS_FACTOR`: Set to `0` to assign one asset to each selected client. Set to a positive number to request that many assets per selected client. Extra assets are unused; when there are fewer asset IPs than requested assignments, IPs are reused in order.
+* `CLIENT_PASS` & `CLIENT_USERNAME`: SSH credentials for AWS Windows clients. Proxmox client commands use the QEMU Guest Agent API instead of SSH.
 * `ACCOUNT_EMAIL_USER` & `ACCOUNT_EMAIL_DOMAIN`: Prefix and domain for generating test accounts (e.g. `yossilior1@oeek.com`).
 * `ASSET_PROTOCOL` & `ASSET_PORT`: Details for connecting to the target assets (e.g., `rdp` on port `3389`).
+* `ASSET_RENDERING_MODE`: `low` opens `LOW_RENDERING_URL` in Edge kiosk mode on each connected Proxmox asset; `high` opens Edge's new-tab page.
+* `LOW_RENDERING_URL`: Clock page used by low-rendering mode; defaults to `https://time.is/`.
 * `PROJECT_NAMESPACE`: Variable prefix selector (e.g. `WATERFALL` or `DEV`).
+
+To use Proxmox VM IPs instead of AWS Terraform outputs, set `IP_SOURCE=proxmox` in `.env`. Configure `PROXMOX_IP`, `TOKEN_ID`, and `SECRET` there; `TOKEN_ID` should use Proxmox's `user@realm!token-id` format and needs `VM.GuestAgent.Unrestricted` permission for guest commands. Proxmox requests currently use `verify=False` for self-signed lab certificates, which disables TLS certificate verification and should only be used on a trusted network; rotate the API token if it has been exposed. Keep `IP_SOURCE=terraform` (the default) to use AWS. VM names must contain `hera` as a separate word for clients or `asset` as a separate word for assets; each VM must be running with the QEMU Guest Agent enabled and report an IPv4 address. Proxmox client VMs also need PsExec at `C:\Windows\System32\PsExec.exe`, an active Windows session 1, and the Tauri executable at `C:\Program Files\hera-client\tauri-client-app.exe`. Setup and local account deletion run as the Windows desktop user, not as SYSTEM, and setup is successful only when that user's Tauri database contains the new account. If nobody is logged into the console, the script logs on with the VM account password and runs the command in that user profile. `CLIENT_PASS` is tried first; other configured lab passwords are tried if that logon is rejected. Login opens Tauri as that same desktop user in session 1. Do not launch it from the guest agent as SYSTEM; WebView2 then fails because it tries to write under `C:\\Windows\\System32\\config\\systemprofile`. By default, the login URL is built as `{API_SCHEME}://{<PROJECT_NAMESPACE>_SERVER_IP}:{<PROJECT_NAMESPACE>_API_PORT}/hera-web`; set `HERA_WEB_URL` to override it. Web login and user creation stay on `<PROJECT_NAMESPACE>_SERVER_IP` (RX-In). The site certificate on that server currently has SAN `10.101.28.42`, and the client stores each account under that certificate address. `--auto-login` must use that stored address as the lookup key, or the window reports `No account found`. The page it opens is still `{API_SCHEME}://<RX-In>:<API_PORT>/hera-web`. A desktop SSH tunnel is only for a workstation outside this subnet and is not used by the clients.
+
+Discovery writes the full ordered client/asset inventory to the gitignored `load_test_ip_lists.json`. Each setup appends its exact client, asset, email, and display-name assignments; only successfully created pairs are eligible for Proxmox teardown. Partial teardown records remain available for retry, so teardown does not reconstruct accounts from a changing IP list.
 
 ---
 
@@ -109,14 +115,14 @@ Open `.env` and fill in your environment parameters:
 
 Execute the interactive test suite control script:
 ```bash
-python3 load_test.py
+python3.12 load_test.py
 ```
 
 ### Script Menu Options:
-* **Option 1 (Run client setup)**: Connects to Windows clients via SSH and runs Tauri CLI commands to register accounts and map assets on the Hera server. If `TX_HOST` and `TX_CERT_FOLDER` are set in `.env`, it also copies the HERA External IP certificate into that TX mTLS folder and rehashes the folder. `TX_CERT_FOLDER` is the folder shown after the one-time SSL Apply. Also set `TX_SSH_USER` and either `TX_SSH_PASS` or `TX_SSH_KEY`.
-* **Option 2 (Run client login)**: Launches `tauri-client-app.exe` headlessly inside RDP session 2 using `psexec` with `--auto-login` and `--url` parameters.
-* **Option 3 (Close client apps)**: Closes Tauri and its child mTLS proxy processes on all clients while keeping Hera users, assets, and certificates intact. Use this before running login again.
-* **Option 4 (Run client teardown)**: Deletes the generated test accounts and assets, removes TX certificates, deletes local Tauri accounts, then closes any remaining client apps.
+* **Option 1 (Run client setup)**: Prompts for the number of client VMs, then assigns assets according to `CLIENT_ASSETS_FACTOR`. Commands run over SSH for AWS or QEMU Guest Agent for Proxmox. Setup exports the TX certificate through the selected client transport, then uploads it to the TX host over SSH and rehashes the certificate folder.
+* **Option 2 (Run client login)**: Prompts for a client count; pressing Enter reuses the count chosen during setup. It launches Tauri in Windows session 1 using PsExec with `--auto-login` and `--url` parameters, opens the configured rendering workload on the assigned Proxmox asset, then retries failed account-to-asset connections once.
+* **Option 3 (Close client apps)**: Prompts for a client count; Enter reuses the setup count. It closes Tauri and its child mTLS proxy processes while keeping Hera users, assets, and certificates intact.
+* **Option 4 (Run client teardown)**: Prompts for a client count; Enter reuses the setup count, or defaults to one client if no setup count is remembered. It deletes generated accounts/assets, removes TX certificates, then closes those client apps. Type `all` to operate on every discovered client.
 * **Option 5 (Exit)**: Exits the menu; optionally runs teardown before exiting.
 
 ---

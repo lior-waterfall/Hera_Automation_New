@@ -63,26 +63,34 @@ def _request(settings, method, path, token=None, body=None):
     payload = None if body is None else json.dumps(body).encode("utf-8")
     last_error = None
     for base in _candidate_bases(settings):
-        request = urllib.request.Request(f"{base}{path}", data=payload, method=method)
-        request.add_header("Accept", "application/json")
-        if body is not None:
-            request.add_header("Content-Type", "application/json")
-        if token:
-            request.add_header("Authorization", f"Bearer {token}")
-        context = ssl._create_unverified_context() if base.startswith("https://") else None
-        try:
-            with urllib.request.urlopen(request, context=context, timeout=30) as response:
-                raw = response.read().decode("utf-8", errors="replace")
+        request_token = token
+        for attempt in range(2):
+            request = urllib.request.Request(f"{base}{path}", data=payload, method=method)
+            request.add_header("Accept", "application/json")
+            if body is not None:
+                request.add_header("Content-Type", "application/json")
+            if request_token:
+                request.add_header("Authorization", f"Bearer {request_token}")
+            context = ssl._create_unverified_context() if base.startswith("https://") else None
+            try:
+                with urllib.request.urlopen(request, context=context, timeout=30) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+                    settings["api_base"] = base
+                    if not raw:
+                        return None
+                    return json.loads(raw)
+            except urllib.error.HTTPError as exc:
                 settings["api_base"] = base
-                if not raw:
-                    return None
-                return json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            settings["api_base"] = base
-            details = exc.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"{method} {path} failed with status {exc.code}: {details}") from exc
-        except urllib.error.URLError as exc:
-            last_error = exc
+                details = exc.read().decode("utf-8", errors="replace").strip()
+                if exc.code == 401 and request_token and attempt == 0:
+                    username, password = split_admin_credentials(settings.get("admin_credentials"))
+                    request_token = _login(settings, username, password)
+                    settings["admin_access_token"] = request_token
+                    continue
+                raise RuntimeError(f"{method} {path} failed with status {exc.code}: {details}") from exc
+            except urllib.error.URLError as exc:
+                last_error = exc
+                break
     raise RuntimeError(f"Could not reach the Hera API: {last_error}")
 
 

@@ -8,6 +8,7 @@
 # ─── Sensitive Runtime Files ──────────────────────────────────────────────────
 load_test.ini
 ips.json
+load_test_ip_lists.json
 
 # ─── Terraform ────────────────────────────────────────────────────────────────
 .terraform/
