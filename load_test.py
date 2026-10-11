@@ -106,6 +106,7 @@ def _read_load_test_settings():
             "asset_encoded_pass": quote(os.environ.get('ASSET_PASS', ''), safe=''),
             "asset_rendering_mode": os.environ.get('ASSET_RENDERING_MODE', 'low').strip().lower(),
             "low_rendering_url": os.environ.get('LOW_RENDERING_URL', 'https://time.is/').strip(),
+            "high_rendering_url": os.environ.get('HIGH_RENDERING_URL', 'https://www.msn.com/').strip(),
             "asset_protocol": os.environ.get('ASSET_PROTOCOL', ''),
             "asset_port": int(os.environ.get('ASSET_PORT', '3389')),
             "api_port": int(os.environ.get(f'{project_namespace}_API_PORT', '0')),
@@ -126,6 +127,17 @@ def _read_load_test_settings():
             "proxmox_token_secret": os.environ.get('SECRET', ''),
             "proxmox_ca_cert": os.environ.get('PROXMOX_CA_CERT', ''),
         }
+        # ASSET_USER/ASSET_PASS stay for EC2; Proxmox assets use their own pair.
+        proxmox_asset_user = os.environ.get('PROXMOX_ASSET_USER', '').strip()
+        proxmox_asset_pass = os.environ.get('PROXMOX_ASSET_PASS', '')
+        settings = load_test_settings_cache
+        settings["proxmox_asset_creds"] = bool(
+            settings["ip_source"] == "proxmox" and proxmox_asset_user and proxmox_asset_pass
+        )
+        if settings["proxmox_asset_creds"]:
+            settings["asset_user"] = proxmox_asset_user
+            settings["asset_pass"] = proxmox_asset_pass
+            settings["asset_encoded_pass"] = quote(proxmox_asset_pass, safe='')
 
     return load_test_settings_cache
 
@@ -375,17 +387,25 @@ def _write_proxmox_file(settings, client_ip, remote_path, content):
             f"{settings['proxmox_token_secret']}"
         )
     }
-    response = requests.post(
-        f"{api_base}/nodes/{node}/qemu/{vmid}/agent/file-write",
-        headers=headers,
-        data={
-            "file": remote_path,
-            "content": content,
-        },
-        verify=False,
-        timeout=20,
-    )
-    response.raise_for_status()
+    for attempt in range(3):
+        response = requests.post(
+            f"{api_base}/nodes/{node}/qemu/{vmid}/agent/file-write",
+            headers=headers,
+            data={
+                "file": remote_path,
+                "content": content,
+            },
+            verify=False,
+            timeout=20,
+        )
+        # The guest agent sometimes drops the mkdir that should have created the folder.
+        if response.status_code == 500 and "cannot find the path" in response.text.lower() and attempt < 2:
+            folder = remote_path.rsplit("\\", 1)[0]
+            _execute_proxmox_command(settings, client_ip, ["cmd.exe", "/c", f"mkdir {folder}"], 15)
+            time.sleep(attempt + 1)
+            continue
+        response.raise_for_status()
+        return
 
 
 def _windows_logon_candidates(settings):
@@ -424,8 +444,7 @@ def _windows_console_user(settings, client_ip):
 
 def _resolve_windows_logon(settings, client_ip):
     """Find a username and password that can log on to this Windows client."""
-    cache_by_ip = settings.setdefault("windows_logon_by_ip", {})
-    cached = cache_by_ip.get(client_ip)
+    cached = settings.get("windows_logon_shared")
     if cached:
         return cached["user"], cached["password"]
     usernames, passwords = _windows_logon_candidates(settings)
@@ -501,7 +520,7 @@ exit 1
             + detail[:300]
         )
     found = {"user": match.group(1), "password": passwords[int(match.group(2))]}
-    cache_by_ip[client_ip] = found
+    settings["windows_logon_shared"] = found
     return found["user"], found["password"]
 
 
@@ -656,22 +675,24 @@ def _readable_powershell_error(text):
     return cleaned or text
 
 
-def _execute_proxmox_interactive_command(settings, client_ip, command, timeout_seconds=None):
+def _execute_proxmox_interactive_command(settings, client_ip, command, timeout_seconds=None, run_as_user=None):
     """Run a command as the Windows desktop user.
 
     A console session is used when one exists. Otherwise the VM username and
     password log the account on, because Tauri only needs that user profile.
+    run_as_user targets a known logged-on user, e.g. an RDP session.
     """
     if isinstance(command, str):
         command = ["cmd.exe", "/c", command]
-    console_user, console_error = _windows_console_user(settings, client_ip)
-    if console_error and "guest-exec" in console_error.lower():
-        return "", console_error, -1, False
-    if not console_user:
-        print(f"    - No console session on {client_ip}; logging on with the VM account.")
-        return _execute_proxmox_credential_command(
-            settings, client_ip, command, timeout_seconds
-        )
+    if not run_as_user:
+        console_user, console_error = _windows_console_user(settings, client_ip)
+        if console_error and "guest-exec" in console_error.lower():
+            return "", console_error, -1, False
+        if not console_user:
+            print(f"    - No console session on {client_ip}; logging on with the VM account.")
+            return _execute_proxmox_credential_command(
+                settings, client_ip, command, timeout_seconds
+            )
 
     task_id = uuid.uuid4().hex
     work_dir = rf"C:\ProgramData\HeraLoadTest\{task_id}"
@@ -732,7 +753,7 @@ $deadline = (Get-Date).AddSeconds({int(timeout)})
 $taskRegistered = $false
 $taskType = 'powershell'
 try {{
-    $activeUser = (Get-CimInstance Win32_ComputerSystem).UserName
+    $activeUser = {("'" + run_as_user.replace("'", "''") + "'") if run_as_user else '(Get-CimInstance Win32_ComputerSystem).UserName'}
     if ([string]::IsNullOrWhiteSpace($activeUser)) {{ throw 'No interactive Windows user is logged in.' }}
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
     & icacls.exe $workDir /grant ($activeUser + ':(OI)(CI)M') | Out-Null
@@ -762,16 +783,25 @@ try {{
         else {{ Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }}
         $result = @{{stdout=''; stderr='Timed out waiting for the interactive-user command.'; exitcode=-1; timed_out=$true}}
     }} else {{
-        $stdoutText = ''
-        $stderrText = ''
-        if (Test-Path -LiteralPath $stdoutPath) {{ $stdoutText = [IO.File]::ReadAllText($stdoutPath) }}
-        if (Test-Path -LiteralPath $stderrPath) {{ $stderrText = [IO.File]::ReadAllText($stderrPath) }}
-        $result = @{{
-            stdout=$stdoutText;
-            stderr=$stderrText;
-            exitcode=[int]([IO.File]::ReadAllText($exitPath));
-            timed_out=$false
+        # The task may still hold the result files open for a moment after creating them.
+        $result = $null
+        for ($i = 0; $i -lt 40 -and $null -eq $result; $i++) {{
+            try {{
+                $stdoutText = ''
+                $stderrText = ''
+                if (Test-Path -LiteralPath $stdoutPath) {{ $stdoutText = [IO.File]::ReadAllText($stdoutPath) }}
+                if (Test-Path -LiteralPath $stderrPath) {{ $stderrText = [IO.File]::ReadAllText($stderrPath) }}
+                $exitText = [IO.File]::ReadAllText($exitPath).Trim()
+                if (-not $exitText) {{ throw 'exit code not written yet' }}
+                $result = @{{
+                    stdout=$stdoutText;
+                    stderr=$stderrText;
+                    exitcode=[int]$exitText;
+                    timed_out=$false
+                }}
+            }} catch {{ Start-Sleep -Milliseconds 250 }}
         }}
+        if ($null -eq $result) {{ throw 'Could not read the interactive command result files.' }}
     }}
     $result | ConvertTo-Json -Compress | Write-Output
 }} finally {{
@@ -952,9 +982,7 @@ def _wait_for_proxmox_local_mtls_proxy(settings, client_ip, timeout_seconds=30):
         "$listeners=Get-NetTCPConnection -LocalPort 5555 -State Listen -ErrorAction SilentlyContinue; "
         "foreach ($listener in $listeners) { "
         "$process=Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue; "
-        "$upstream=Get-NetTCPConnection -OwningProcess $listener.OwningProcess -State Established -ErrorAction SilentlyContinue | "
-        f"Where-Object {{ $_.RemoteAddress -eq '{settings['client_site_ip']}' -and $_.RemotePort -eq {int(settings['mtls_port'])} }}; "
-        "if ($process.ProcessName -eq 'TpmMtlsProxy' -and $upstream) { exit 0 } }; "
+        "if ($process.ProcessName -eq 'TpmMtlsProxy') { exit 0 } }; "
         "Start-Sleep -Seconds 1 }; exit 1"
     )
     encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
@@ -1021,17 +1049,14 @@ def _proxmox_tauri_visible_in_session(settings, client_ip, session_id=1):
 
 def _proxmox_tauri_processes_stopped(settings, client_ip):
     """Confirm both Tauri and its proxy exited before a retry can launch again."""
-    script = (
-        "$p=@(Get-Process tauri-client-app,TpmMtlsProxy -ErrorAction SilentlyContinue); "
-        "Write-Output ('PROCESS_COUNT=' + $p.Count); "
-        "if ($p.Count -eq 0) { exit 0 }; exit 1"
-    )
-    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+    # tasklist avoids PowerShell start-up, which can exceed the timeout on busy VMs.
     output, _error_output, exit_status, timed_out = _execute_proxmox_command(
-        settings, client_ip, command, 20
+        settings, client_ip, ["tasklist.exe", "/FO", "CSV", "/NH"], 30
     )
-    return not timed_out and exit_status == 0 and "PROCESS_COUNT=0" in (output or "")
+    if timed_out or exit_status != 0 or not output:
+        return False
+    running = output.lower()
+    return '"tauri-client-app.exe"' not in running and '"tpmmtlsproxy.exe"' not in running
 
 
 def _stop_proxmox_tauri_windows(settings, client_ip):
@@ -1043,7 +1068,7 @@ def _stop_proxmox_tauri_windows(settings, client_ip):
             ["taskkill.exe", "/F", "/IM", process_name, "/T"],
             10,
         )
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if _proxmox_tauri_processes_stopped(settings, client_ip):
             return
@@ -1185,8 +1210,13 @@ def _execute_proxmox_login_with_proxy_retry(settings, client_ip, command):
         "-File", remote_script,
     ]
     _stop_proxmox_tauri_windows(settings, client_ip)
-    if not _proxmox_tauri_processes_stopped(settings, client_ip):
-        return "", "Existing Tauri or mTLS proxy processes could not be stopped.", -1, False
+    for _attempt in range(2):
+        if _proxmox_tauri_processes_stopped(settings, client_ip):
+            break
+        _stop_proxmox_tauri_windows(settings, client_ip)
+    else:
+        if not _proxmox_tauri_processes_stopped(settings, client_ip):
+            return "", "Existing Tauri or mTLS proxy processes could not be stopped.", -1, False
     output = error_output = ""
     exit_status = -1
     timed_out = False
@@ -1204,7 +1234,7 @@ def _execute_proxmox_login_with_proxy_retry(settings, client_ip, command):
         if _wait_for_proxmox_local_mtls_proxy(settings, client_ip, 60):
             visible, detail = _proxmox_tauri_visible_in_session(settings, client_ip)
             if visible:
-                time.sleep(30)
+                time.sleep(5)
                 visible, detail = _proxmox_tauri_visible_in_session(settings, client_ip)
                 proxy_ready = _wait_for_proxmox_local_mtls_proxy(settings, client_ip, 1)
                 if visible and proxy_ready:
@@ -1302,17 +1332,120 @@ def _proxmox_desktop_username(settings, client_ip):
     return username
 
 
-def _apply_client_credentials_to_asset(settings, client_ip, asset_ip=None):
-    """Use credentials verified against the assigned asset for auto-connect."""
-    if settings.get("ip_source") != "proxmox":
+def _apply_client_credentials_to_asset(settings, client_ip):
+    """Use the client desktop login for the asset. Proxmox assets share that account."""
+    if settings.get("ip_source") != "proxmox" or settings.get("proxmox_asset_creds"):
         return
-    username, password = _resolve_windows_logon(settings, asset_ip or client_ip)
+    username = _proxmox_desktop_username(settings, client_ip)
+    password = settings.get("client_pass") or settings.get("asset_pass") or ""
     if username:
         settings["asset_user"] = username
-        print(f"    - Asset login user is {username}.")
+        print(f"    - Asset login user is the client desktop user {username}.")
     if password:
         settings["asset_pass"] = password
         settings["asset_encoded_pass"] = quote(password, safe="")
+
+
+def _asset_session_user(settings, asset_ip, timeout_seconds=120):
+    """Wait for the active HERA RDP session on the asset and return its DOMAIN\\user."""
+    script = (
+        "$active = & quser.exe 2>$null | Select-Object -Skip 1 | ForEach-Object { "
+        "if ($_ -match '\\s(\\d+)\\s+Active\\s') { [int]$matches[1] } } | Select-Object -First 1; "
+        "if ($null -eq $active) { exit 1 }; "
+        "$p=Get-CimInstance Win32_Process -Filter (\"Name='explorer.exe' AND SessionId=\" + $active) | Select-Object -First 1; "
+        "if ($p) { $o=Invoke-CimMethod -InputObject $p -MethodName GetOwner; "
+        "if ($o.User) { Write-Output ($o.Domain + '\\' + $o.User); exit 0 } }; exit 1"
+    )
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        output, _error, status, timed_out = _execute_proxmox_command(settings, asset_ip, command, 20)
+        user = (output or "").strip().splitlines()[-1].strip() if (output or "").strip() else ""
+        if not timed_out and status == 0 and user:
+            return user
+        time.sleep(5)
+    return ""
+
+
+def _open_asset_rendering(settings, asset_ip):
+    """Open Edge full screen in the asset's HERA session: a clock (low) or moving content (high)."""
+    mode = settings["asset_rendering_mode"]
+    url = settings["low_rendering_url"] if mode == "low" else settings["high_rendering_url"]
+    user = _asset_session_user(settings, asset_ip)
+    if not user:
+        raise RuntimeError(f"No desktop session appeared on asset {asset_ip}.")
+    payload = base64.b64encode(url.encode("utf-8")).decode("ascii")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$url = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))
+$edge = @('C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe') | Where-Object {{ Test-Path -LiteralPath $_ }} | Select-Object -First 1
+if (-not $edge) {{ throw 'Microsoft Edge is not installed on the asset.' }}
+# Kiosk flags are ignored when Edge is already running.
+Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+Start-Process -FilePath $edge -ArgumentList @('--kiosk', $url, '--edge-kiosk-type=fullscreen', '--no-first-run', '--autoplay-policy=no-user-gesture-required')
+Start-Sleep -Seconds 5
+if (-not (Get-Process msedge -ErrorAction SilentlyContinue)) {{ throw 'Edge did not stay open on the asset.' }}
+Write-Output 'ASSET_RENDERING_STARTED'
+""".strip()
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    output, error, status, timed_out = _execute_proxmox_interactive_command(
+        settings, asset_ip,
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        60, run_as_user=user,
+    )
+    if timed_out or status != 0 or "ASSET_RENDERING_STARTED" not in (output or ""):
+        raise RuntimeError((error or output or f"exit {status}").strip())
+    return user
+
+
+def _disable_asset_setup_screen(settings, asset_ip):
+    """Turn off the Windows "almost done setting up your PC" screen, which covers the HERA session.
+
+    Windows reads this only at sign-in, so it must run before HERA opens the RDP session.
+    """
+    payload = base64.b64encode(settings["asset_user"].encode("utf-8")).decode("ascii")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$user = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))
+$sid = (New-Object Security.Principal.NTAccount($env:COMPUTERNAME, $user)).Translate([Security.Principal.SecurityIdentifier]).Value
+$root = "Registry::HKEY_USERS\\$sid"
+$loaded = $false
+if (-not (Test-Path $root)) {{
+    $profilePath = (Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
+    if (-not $profilePath -or -not (Test-Path "$profilePath\\NTUSER.DAT")) {{ Write-Output 'NO_PROFILE'; exit 0 }}
+    & reg.exe load 'HKU\\HeraLoadTest' "$profilePath\\NTUSER.DAT" | Out-Null
+    $root = 'Registry::HKEY_USERS\\HeraLoadTest'
+    $loaded = $true
+}}
+try {{
+    $engagement = "$root\\Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement"
+    New-Item -Path $engagement -Force | Out-Null
+    Set-ItemProperty -Path $engagement -Name ScoobeSystemSettingEnabled -Value 0 -Type DWord
+    $content = "$root\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
+    New-Item -Path $content -Force | Out-Null
+    Set-ItemProperty -Path $content -Name 'SubscribedContent-310093Enabled' -Value 0 -Type DWord
+}} finally {{
+    if ($loaded) {{ [gc]::Collect(); & reg.exe unload 'HKU\\HeraLoadTest' | Out-Null }}
+}}
+# HERA would otherwise reconnect to an old session that already shows the setup screen.
+$ErrorActionPreference = 'Continue'
+$sessionIds = @(& quser.exe 2>$null | Select-Object -Skip 1 | ForEach-Object {{
+    if ($_ -match '^\\s*>?(\\S+)\\s.*?\\s(\\d+)\\s+(Active|Disc)') {{ if ($matches[1] -ieq $user) {{ $matches[2] }} }}
+}})
+foreach ($id in $sessionIds) {{ & logoff.exe $id 2>$null }}
+if ($sessionIds.Count -gt 0) {{ Start-Sleep -Seconds 5 }}
+Write-Output 'SETUP_SCREEN_DISABLED'
+""".strip()
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    output, error, status, timed_out = _execute_proxmox_command(
+        settings, asset_ip,
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        60,
+    )
+    if timed_out or status != 0:
+        print(f"    - Could not disable the Windows setup screen on {asset_ip}: {_readable_powershell_error(error) or output}")
 
 
 def _existing_setup_emails(settings):
@@ -1475,7 +1608,7 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                         assets_processed += 1
                         continue
 
-                    _apply_client_credentials_to_asset(settings, client_ip, asset_ip)
+                    _apply_client_credentials_to_asset(settings, client_ip)
                     tauri_command = get_tauri_command(load_test_counter, asset_ip)
                     command_text = (
                         tauri_command if isinstance(tauri_command, str)
@@ -1744,6 +1877,8 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
         display_name = record["asset_display_name"]
         client_ip = record["client_ip"]
         print(f"\nTearing down recorded pair: {client_ip} -> {asset_ip} ({email})")
+        # A live HERA session on the asset makes the server reject the asset delete.
+        _stop_proxmox_tauri_windows(settings, client_ip)
 
         cleanup_errors = []
         web_cleanup_ok = True
@@ -1972,47 +2107,25 @@ def run_client_login(max_clients=None):
             f"{latest_setup.get('started_at', 'the latest setup')}."
         )
 
-        if settings["asset_rendering_mode"] not in {"low", "high"}:
-            print("ASSET_RENDERING_MODE must be 'low' or 'high'.")
+        rendering_mode = settings["asset_rendering_mode"]
+        if rendering_mode not in {"low", "high", "off"}:
+            print("ASSET_RENDERING_MODE must be 'low', 'high' or 'off'.")
             return
 
-        def open_asset_rendering(asset_ip):
-            user, _error = _windows_console_user(settings, asset_ip)
-            deadline = time.monotonic() + 30
-            while not user and time.monotonic() < deadline:
-                time.sleep(2)
-                user, _error = _windows_console_user(settings, asset_ip)
-            if not user:
-                raise RuntimeError(f"No interactive desktop appeared on asset {asset_ip}.")
-
-            payload = base64.b64encode(json.dumps({
-                "mode": settings["asset_rendering_mode"],
-                "url": settings["low_rendering_url"],
-            }).encode("utf-8")).decode("ascii")
-            script = f"""
-$ErrorActionPreference = 'Stop'
-$spec = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}')) | ConvertFrom-Json
-$edge = @('C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe') | Where-Object {{ Test-Path -LiteralPath $_ }} | Select-Object -First 1
-if (-not $edge) {{ throw 'Microsoft Edge is not installed on the asset.' }}
-$arguments = @('--new-window', '--no-first-run')
-if ($spec.mode -eq 'low') {{
-    if (-not $spec.url) {{ throw 'LOW_RENDERING_URL is empty.' }}
-    $arguments += @('--kiosk', [string]$spec.url, '--edge-kiosk-type=fullscreen')
-}}
-Start-Process -FilePath $edge -ArgumentList $arguments
-Start-Sleep -Seconds 2
-if (-not (Get-Process msedge -ErrorAction SilentlyContinue)) {{ throw 'Edge did not remain open on the asset.' }}
-Write-Output ('ASSET_RENDERING_STARTED=' + $spec.mode)
-""".strip()
-            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-            output, error, status, timed_out = _execute_proxmox_interactive_command(
-                settings,
-                asset_ip,
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                30,
-            )
-            if timed_out or status != 0 or "ASSET_RENDERING_STARTED=" not in output:
-                raise RuntimeError((error or output or f"exit {status}").strip())
+        def open_rendering(record):
+            if rendering_mode == "off":
+                return True
+            try:
+                _open_asset_rendering(settings, record["asset_ip"])
+            except Exception as exc:
+                record["asset_render_status"] = "failed"
+                record["asset_render_error"] = str(exc)
+                print(f"  - {rendering_mode} rendering failed on asset {record['asset_ip']}: {exc}")
+                return False
+            record["asset_render_status"] = rendering_mode
+            record.pop("asset_render_error", None)
+            print(f"  - {rendering_mode} rendering opened on asset {record['asset_ip']}.")
+            return True
 
         def attempt_login(record, retry=False):
             counter = int(record["counter"])
@@ -2031,12 +2144,12 @@ Write-Output ('ASSET_RENDERING_STARTED=' + $spec.mode)
                 record["login_finished_at"] = datetime.now(timezone.utc).isoformat()
                 _save_ip_inventory(inventory)
                 print(f"  - Login skipped: {exc}")
-                return False
-            _apply_client_credentials_to_asset(settings, client_ip, asset_ip)
-            web_url = settings["hera_web_url"] or (
-                f'{settings["api_scheme"]}://{settings["server_ip"]}:'
-                f'{settings["api_port"]}/hera-web'
-            )
+                return
+            _apply_client_credentials_to_asset(settings, client_ip)
+            if rendering_mode != "off":
+                _disable_asset_setup_screen(settings, asset_ip)
+            # The page runs in the server-side browser; an RX-In URL bypasses mTLS and breaks the session.
+            web_url = settings["hera_web_url"] or "http://hera-hera-web:3000/hera-web"
             command = [
                 r"C:\\Windows\\System32\\PsExec.exe",
                 "-i", "1", "/accepteula", "-d",
@@ -2049,44 +2162,55 @@ Write-Output ('ASSET_RENDERING_STARTED=' + $spec.mode)
             output, error_output, exit_status, timed_out = _execute_proxmox_login_with_proxy_retry(
                 settings, client_ip, command
             )
-            proxy_started = not timed_out and exit_status == 0
-            rendering_started = False
-            if proxy_started:
-                print(f"  - Tauri opened and asset auto-connect was started for {email}.")
-                try:
-                    open_asset_rendering(asset_ip)
-                    record["asset_render_status"] = "started"
-                    record.pop("asset_render_error", None)
-                    rendering_started = True
-                    print(f"  - {settings['asset_rendering_mode']} rendering opened on asset {asset_ip}.")
-                except Exception as exc:
-                    record["asset_render_status"] = "failed"
-                    record["asset_render_error"] = str(exc)
-                    print(f"  - Asset rendering failed on {asset_ip}: {exc}")
-            else:
-                record["login_error"] = (error_output or output or f"exit {exit_status}").strip()
-                print(f"  - Login failed for {email}: {record['login_error']}")
-            succeeded = proxy_started and rendering_started
+            succeeded = not timed_out and exit_status == 0
             record["login_status"] = "connected" if succeeded else "failed"
             record["login_finished_at"] = datetime.now(timezone.utc).isoformat()
             if succeeded:
                 record.pop("login_error", None)
-            elif proxy_started:
-                record["login_error"] = record.get("asset_render_error", "Asset rendering did not start.")
+                print(f"  - Tauri opened and asset auto-connect was started for {email}.")
+                # HERA sometimes logs in but never starts the auto-connect; count that as a failed login.
+                if not _asset_session_user(settings, asset_ip):
+                    record["login_status"] = "failed"
+                    record["login_error"] = f"HERA did not open a session on asset {asset_ip}."
+                    print(f"  - {record['login_error']}")
+                else:
+                    print(f"  - Asset session is open on {asset_ip}.")
+                    open_rendering(record)
+            else:
+                record["login_error"] = (error_output or output or f"exit {exit_status}").strip()
+                print(f"  - Login failed for {email}: {record['login_error']}")
             _save_ip_inventory(inventory)
-            return succeeded
 
         for record in records:
             attempt_login(record)
 
-        failed_records = [
-            record for record in records
-            if record.get("login_status") == "failed" or record.get("asset_render_status") == "failed"
+        failed_logins = [r for r in records if r.get("login_status") != "connected"]
+        failed_renders = [
+            r for r in records
+            if r.get("login_status") == "connected" and r.get("asset_render_status") == "failed"
         ]
-        if failed_records:
-            print(f"\nRetrying {len(failed_records)} failed account-to-asset connection(s) once.")
-            for record in failed_records:
-                attempt_login(record, retry=True)
+        if failed_logins or failed_renders:
+            print(
+                f"\nRetrying once: {len(failed_logins)} failed login(s), "
+                f"{len(failed_renders)} failed rendering(s)."
+            )
+        for record in failed_logins:
+            attempt_login(record, retry=True)
+        for record in failed_renders:
+            print(f"\nRetrying {rendering_mode} rendering on asset {record['asset_ip']}...")
+            open_rendering(record)
+            _save_ip_inventory(inventory)
+
+        connected = [r for r in records if r.get("login_status") == "connected"]
+        print(f"\nLogin summary: {len(connected)}/{len(records)} client(s) connected to their asset.")
+        if rendering_mode != "off":
+            rendered = [r for r in connected if r.get("asset_render_status") == rendering_mode]
+            print(f"Rendering summary: {len(rendered)}/{len(records)} asset(s) running {rendering_mode} rendering.")
+        for record in records:
+            if record.get("login_status") != "connected":
+                print(f"  - Still failed: {record['client_ip']} ({record['email']}): {record.get('login_error', '')[:200]}")
+            elif rendering_mode != "off" and record.get("asset_render_status") != rendering_mode:
+                print(f"  - Rendering failed: asset {record['asset_ip']}: {record.get('asset_render_error', '')[:200]}")
         return
 
     def get_login_command(counter, asset_ip):

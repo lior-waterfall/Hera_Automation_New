@@ -2,6 +2,7 @@
 
 import json
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -122,16 +123,28 @@ def erase_web_user_and_asset(settings, email, display_name, asset_host):
     matches = matching_connections(connections, display_name, asset_host)
     if not matches:
         print(f"    - No web asset found for {display_name} at {asset_host}")
+    asset_errors = []
     for connection in matches:
         connection_id = connection["id"]
-        _request(settings, "DELETE", f"/api/connections/{connection_id}", token=token)
-        print(f"    - Deleted web asset {display_name} ({asset_host})")
+        # The server can briefly return 500 while the asset's session is still closing.
+        for attempt in range(3):
+            try:
+                _request(settings, "DELETE", f"/api/connections/{connection_id}", token=token)
+                print(f"    - Deleted web asset {display_name} ({asset_host})")
+                break
+            except RuntimeError as exc:
+                if attempt == 2:
+                    asset_errors.append(str(exc))
+                    print(f"    - Could not delete web asset {display_name}: {exc}")
+                else:
+                    time.sleep(5)
 
     users = _request(settings, "GET", "/api/admin/users", token=token) or []
     user = find_user(users, email)
     if not user or not user.get("user_id"):
         print(f"    - No web user found for {email}")
-        return
-    user_id = user["user_id"]
-    _request(settings, "DELETE", f"/api/admin/users/{user_id}", token=token)
-    print(f"    - Deleted web user {email} and its server certificate")
+    else:
+        _request(settings, "DELETE", f"/api/admin/users/{user['user_id']}", token=token)
+        print(f"    - Deleted web user {email} and its server certificate")
+    if asset_errors:
+        raise RuntimeError("; ".join(asset_errors))
