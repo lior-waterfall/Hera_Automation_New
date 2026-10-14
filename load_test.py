@@ -1239,7 +1239,12 @@ def _execute_proxmox_login_with_proxy_retry(settings, client_ip, command):
                 proxy_ready = _wait_for_proxmox_local_mtls_proxy(settings, client_ip, 1)
                 if visible and proxy_ready:
                     return output, error_output, exit_status, False
-                failure_detail = detail or "Tauri or TpmMtlsProxy exited shortly after launch."
+                if not visible:
+                    failure_detail = detail or "Tauri exited shortly after launch."
+                elif not proxy_ready:
+                    failure_detail = "Tauri remained visible, but TpmMtlsProxy stopped listening on 127.0.0.1:5555."
+                else:
+                    failure_detail = "Tauri or TpmMtlsProxy exited shortly after launch."
             else:
                 failure_detail = detail or "Tauri is not visible in session 1 as the desktop user."
         _stop_proxmox_tauri_windows(settings, client_ip)
