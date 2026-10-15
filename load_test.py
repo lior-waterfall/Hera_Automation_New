@@ -885,7 +885,7 @@ def _desktop_tauri_account_emails(output):
     return [row[0] for row in rows if row and row[0]]
 
 
-def _desktop_tauri_account_present(settings, client_ip, email):
+def _desktop_tauri_account_present(settings, client_ip, email, strict=False):
     """Return whether the logged-in desktop user's Tauri database contains email."""
     script = (
         "$p=Join-Path $env:USERPROFILE '.hera\\client_db.sqlite'; "
@@ -909,14 +909,30 @@ def _desktop_tauri_account_present(settings, client_ip, email):
     )
     profile = next((line.strip() for line in (output or "").splitlines() if line.startswith("PROFILE=")), "")
     if timed_out:
+        if strict:
+            raise RuntimeError(f"Timed out checking the desktop Tauri account database. {profile}".strip())
         return False, f"Timed out checking the desktop Tauri account database. {profile}".strip()
     if "ACCOUNT_WRONG_PROFILE" in (output or ""):
+        if strict:
+            raise RuntimeError(f"Account check ran in the SYSTEM profile. {profile}".strip())
         return False, profile or "Account check ran in the SYSTEM profile."
     if exit_status == 2 or "ACCOUNT_MISSING" in (output or ""):
         return False, profile or "Desktop Tauri database does not exist."
+    if strict and exit_status != 0:
+        raise RuntimeError(
+            f"Could not check the desktop Tauri account database: "
+            f"{error_output.strip() or output.strip() or f'exit {exit_status}'}"
+        )
     try:
+        if strict and not any(
+            line.strip() and not line.startswith("PROFILE=")
+            for line in (output or "").splitlines()
+        ):
+            raise ValueError("Database export was empty.")
         emails = _desktop_tauri_account_emails(output)
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"Could not read the desktop Tauri database. {profile} {exc}".strip()) from exc
         return False, f"Could not read the desktop Tauri database. {profile} {exc}".strip()
     wanted = email.strip().lower()
     if any((stored or "").strip().lower() == wanted for stored in emails):
@@ -1883,9 +1899,13 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
         client_ip = record["client_ip"]
         print(f"\nTearing down recorded pair: {client_ip} -> {asset_ip} ({email})")
         # A live HERA session on the asset makes the server reject the asset delete.
-        _stop_proxmox_tauri_windows(settings, client_ip)
-
         cleanup_errors = []
+        try:
+            _stop_proxmox_tauri_windows(settings, client_ip)
+        except Exception as exc:
+            cleanup_errors.append(f"Client session shutdown: {exc}")
+            print(f"    - Could not stop the client session on {client_ip}: {exc}")
+
         web_cleanup_ok = True
         try:
             erase_web_user_and_asset(settings, email, display_name, asset_ip)
@@ -1898,6 +1918,8 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
             tx_result = delete_tx_certificate(settings, email)
             if tx_upload_configured(settings) and tx_result is False:
                 tx_cleanup_ok = False
+                cleanup_errors.append("TX certificate cleanup: delete or rehash failed; check the TX output.")
+                print(f"    - TX certificate cleanup failed for {email}; check the TX output.")
         except Exception as exc:
             tx_cleanup_ok = False
             cleanup_errors.append(f"TX certificate cleanup: {exc}")
@@ -1907,35 +1929,92 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
             r"C:\Program Files\hera-client\tauri-client-app.exe",
             f"--delete-account={email}",
         ]
-        output, error_output, exit_status, timed_out = _execute_proxmox_interactive_command(
-            settings, client_ip, command, 45
-        )
-        local_deleted = (not timed_out) and _account_delete_confirmed(output, error_output)
-        if local_deleted:
-            still_present, detail = _desktop_tauri_account_present(settings, client_ip, email)
-            if still_present:
-                local_deleted = False
-                error_output = (
-                    f"{error_output}\nAccount still present in the desktop Tauri database. {detail}"
-                ).strip()
+        local_deleted = False
+        local_error = ""
+        try:
+            output, error_output, exit_status, timed_out = _execute_proxmox_interactive_command(
+                settings, client_ip, command, 45
+            )
+            local_deleted = (not timed_out) and _account_delete_confirmed(output, error_output)
+            if local_deleted:
+                still_present, detail = _desktop_tauri_account_present(
+                    settings, client_ip, email, strict=True
+                )
+                if still_present:
+                    local_deleted = False
+                    local_error = f"Account still present in the desktop Tauri database. {detail}"
+            else:
+                local_error = error_output.strip() or output.strip() or f"exit {exit_status}"
+                if timed_out:
+                    local_error = f"Timed out deleting the local account. {local_error}"
+        except Exception as exc:
+            local_deleted = False
+            local_error = str(exc)
         if local_deleted:
             print(f"    - Local Tauri account delete command succeeded for {email}.")
         else:
-            cleanup_errors.append(
-                f"Local Tauri cleanup: {error_output.strip() or output.strip() or f'exit {exit_status}'}"
-            )
-            print(f"    - Local Tauri account delete failed for {email}: {error_output.strip() or output.strip()}")
+            cleanup_errors.append(f"Local Tauri cleanup: {local_error}")
+            print(f"    - Local Tauri account delete failed or unconfirmed for {email}: {local_error}")
 
-        pair_cleaned = web_cleanup_ok and tx_cleanup_ok and local_deleted
+        pair_cleaned = not cleanup_errors and web_cleanup_ok and tx_cleanup_ok and local_deleted
         record["status"] = "cleaned" if pair_cleaned else "teardown_partial"
         record["cleanup_errors"] = cleanup_errors
+        record["cleanup_results"] = {
+            "web": web_cleanup_ok,
+            "tx": tx_cleanup_ok,
+            "local": local_deleted,
+        }
         record["teardown_finished_at"] = datetime.now(timezone.utc).isoformat()
         _save_ip_inventory(inventory)
         if client_ip not in completed_clients:
             completed_clients.append(client_ip)
 
     run_client_close(client_ips_override=completed_clients)
+    _print_proxmox_teardown_summary(selected_records, settings)
     return True
+
+
+def _print_proxmox_teardown_summary(records, settings):
+    records_by_client = {}
+    for record in records:
+        records_by_client.setdefault(record["client_ip"], []).append(record)
+    attention_count = sum(
+        any(record["status"] != "cleaned" for record in client_records)
+        for client_records in records_by_client.values()
+    )
+    cleaned_count = sum(record["status"] == "cleaned" for record in records)
+    print("\nProxmox teardown summary (selected assignments only)")
+    print(
+        f"VMs: {len(records_by_client) - attention_count} fully cleaned; "
+        f"{attention_count} need attention"
+    )
+    print(f"Accounts: {cleaned_count} cleaned; {len(records) - cleaned_count} partial/unconfirmed")
+    for client_ip, client_records in records_by_client.items():
+        vm = settings.get("proxmox_vms_by_ip", {}).get(client_ip, {})
+        identity = f"{client_ip} (VMID {vm.get('vmid', 'unknown')}, node {vm.get('node', 'unknown')})"
+        needs_attention = any(record["status"] != "cleaned" for record in client_records)
+        print(f"  - {identity}: {'NEEDS ATTENTION' if needs_attention else 'CLEANED'}")
+        for record in client_records:
+            if record["status"] == "cleaned":
+                continue
+            results = record["cleanup_results"]
+            print(
+                f"    Manual cleanup required: {record['email']} -> "
+                f"{record['asset_display_name']} ({record['asset_ip']})"
+            )
+            print(
+                "      " + "; ".join(
+                    f"{label}: {'OK' if results[key] else 'FAILED/UNCONFIRMED'}"
+                    for key, label in (
+                        ("web", "Web user/asset"),
+                        ("tx", "TX certificate"),
+                        ("local", "Local Tauri account"),
+                    )
+                )
+            )
+            for error in record["cleanup_errors"]:
+                print(f"      - {error}")
+    print(f"Results saved in {IP_INVENTORY_PATH}; partial assignments can be retried with teardown.")
 
 
 def run_client_teardown(max_clients=None):

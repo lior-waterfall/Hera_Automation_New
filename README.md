@@ -1,202 +1,275 @@
-# AWS Load Test Infrastructure
+# HERA Client Load-Test Automation
 
-This project provisions AWS EC2 instances (Windows Tauri clients and Linux assets) using Terraform and runs automated load testing against them via a Python execution script.
+This repository automates test-account setup, HERA client login, and cleanup across Windows client VMs. It supports two ways to find and manage those VMs:
 
----
+1. **Proxmox (recommended for this guide):** discovers running VMs through the Proxmox API and runs Windows commands through the QEMU Guest Agent.
+2. **AWS with Terraform:** provisions EC2 clients and assets and connects to Windows clients over SSH.
 
-## Table of Contents
-1. [Architecture Overview](#architecture-overview)
-2. [Prerequisites](#prerequisites)
-3. [Step 1 — Environment Configuration (`.env`)](#step-1--environment-configuration-env)
-4. [Step 2 — Provision Infrastructure via Terraform](#step-2--provision-infrastructure-via-terraform)
-5. [Step 3 — Run the Load Tests](#step-3--run-the-load-tests)
-6. [Step 4 — Tear Down Resources](#step-4--tear-down-resources)
-7. [Deep Dive: EC2, AMIs, and Security Groups](#deep-dive-ec2-amis-and-security-groups)
-    * [How to Create Custom AMIs](#how-to-create-custom-amis)
-    * [Choosing & Managing Security Groups (SG)](#choosing--managing-security-groups-sg)
+The Python runner is interactive. It creates accounts and asset assignments in HERA; it does **not** install the HERA client application or prepare guest operating systems. Prepare the VMs first.
 
----
+## Contents
 
-## Architecture Overview
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Proxmox: prepare and run](#proxmox-prepare-and-run)
+- [AWS and Terraform](#aws-and-terraform)
+- [Configuration reference](#configuration-reference)
+- [Run the automation](#run-the-automation)
+- [Setup inventory and recovery](#setup-inventory-and-recovery)
+- [Optional TX certificate upload](#optional-tx-certificate-upload)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
 
-```
-                          +-------------------------+
-                          |   Hera Web/API Server   |
-                          |   (k8s API & Web App)   |
-                          +------------+------------+
-                                       ^
-                                       | TLS / HTTPS APIs
-                                       |
-                   +-------------------+-------------------+
-                   |                                       |
-    +--------------+--------------+         +--------------+--------------+
-    |   Hera Tauri Client 1       |         |   Hera Tauri Client N       |
-    |   - Windows Server          |   ...   |   - Windows Server          |
-    |   - Runs tauri-client-app   |         |   - Runs tauri-client-app   |
-    +--------------+--------------+         +--------------+--------------+
-                   |                                       |
-                   | RDP Session                           | RDP Session
-                   v                                       v
-    +--------------+--------------+         +--------------+--------------+
-    |   Hera Asset 1              |   ...   |   Hera Asset M              |
-    |   - Linux Target Node       |         |   - Linux Target Node       |
-    +-----------------------------+         +-----------------------------+
+## How it works
+
+```text
+                         HERA Web/API
+                             ^
+                             | HTTPS / mTLS
+                             |
+ Runner ---> Windows HERA clients ---> target assets
+              (Tauri app)               (for example, RDP)
 ```
 
----
+The runner discovers clients and assets using the selected source, assigns assets to clients, and invokes the installed Tauri app on each client. Setup creates HERA accounts and asset records. Login opens Tauri and starts the configured asset connection. Teardown removes the generated HERA data and local accounts.
 
-## Prerequisites
+| Environment | Discovery | Remote client commands | Notes |
+|---|---|---|---|
+| Proxmox | Proxmox API and each VM's guest-agent network information | QEMU Guest Agent | Uses a local inventory file to remember exact setup assignments and support safe teardown. |
+| AWS/Terraform | `terraform output -json` | SSH to each Windows client | Terraform provisions the instances; the runner does not create infrastructure itself. |
 
-Before starting, ensure the following are installed and configured on your host machine:
+## Requirements
 
-### 1. Terraform (v1.0+)
-Install Terraform from the official HashiCorp website.
-Verify installation:
+### On the machine running the script
+
+- Python 3.8 or newer.
+- `paramiko` and `requests`.
+- Network access to the selected VM-management interface and the HERA services.
+- For AWS/Terraform: Terraform 1.0 or newer and AWS credentials accepted by the AWS provider.
+- For Proxmox: access to the Proxmox API from the runner.
+
+Create a virtual environment and install the Python dependencies:
+
 ```bash
-terraform -version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install paramiko requests
 ```
 
-### 2. AWS CLI & Credentials
-Configure your default AWS region and access keys:
-```bash
-aws configure
-```
-Verify connectivity:
-```bash
-aws sts get-caller-identity
-```
+On Windows, activate the virtual environment with `.venv\Scripts\activate` instead of the `source` command.
 
-### 3. Python 3 & Dependencies
-Ensure Python 3.8+ and the `paramiko` and `requests` libraries are installed:
-```bash
-sudo dnf install -y python3 python3-pip
-pip3.12 install paramiko requests
-```
+### Prepare the HERA VMs
 
----
+Both environments need Windows client VMs with:
 
-## Step 1 — Environment Configuration (`.env`)
+- The HERA Tauri client installed at `C:\Program Files\hera-client\tauri-client-app.exe`.
+- A Windows account and password the runner can use for the required commands.
+- Network access to the configured HERA API and target assets.
 
-Copy the configuration template to create your `.env` file:
+For AWS, the runner connects to each client over SSH. For Proxmox, the runner uses the QEMU Guest Agent API; enable and run the guest agent inside the VMs.
+
+## Proxmox: prepare and run
+
+Use this path when your VMs are managed by Proxmox. It does not provision VMs; it discovers already-running ones.
+
+### 1. Prepare the Proxmox VMs
+
+In Proxmox:
+
+- Start the client and asset VMs and enable the QEMU Guest Agent for each VM the script must inspect or control.
+- Ensure the guest agent reports a usable IPv4 address.
+- Name clients with `hera` as a separate word (for example, `Hera Client 01`) and assets with `asset` as a separate word (for example, `Hera Asset 01`). Names containing both markers or neither are ignored.
+- Install PsExec at `C:\Windows\System32\PsExec.exe` on each client.
+- Install the HERA client at the path listed above.
+- Ensure a Windows desktop session can be opened on each client. The script uses the logged-in desktop user when present; otherwise, it attempts to log on with configured VM credentials. Tauri setup and local account deletion must run in the user's profile, not as `SYSTEM`.
+- If you want the script to open Edge rendering on assets during login, those assets also need a usable Windows desktop session, the guest agent, and Microsoft Edge. Set `ASSET_RENDERING_MODE=off` to skip rendering.
+
+Create a Proxmox API token that can enumerate VMs and use the guest agent for those VMs. The token needs the appropriate Proxmox permissions, including `VM.GuestAgent.Unrestricted` for guest commands.
+
+### 2. Configure the runner
+
+Create a local environment file:
+
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in your environment parameters:
-* `CLIENT_ASSETS_FACTOR`: Set to `0` to assign one asset to each selected client. Set to a positive number to request that many assets per selected client. Extra assets are unused; when there are fewer asset IPs than requested assignments, IPs are reused in order.
-* `CLIENT_PASS` & `CLIENT_USERNAME`: SSH credentials for AWS Windows clients. Proxmox client commands use the QEMU Guest Agent API instead of SSH.
-* `ACCOUNT_EMAIL_USER` & `ACCOUNT_EMAIL_DOMAIN`: Prefix and domain for generating test accounts (e.g. `yossilior1@oeek.com`).
-* `ASSET_PROTOCOL` & `ASSET_PORT`: Details for connecting to the target assets (e.g., `rdp` on port `3389`).
-* `ASSET_RENDERING_MODE`: `low` opens `LOW_RENDERING_URL` in Edge kiosk mode on each connected Proxmox asset; `high` opens Edge's new-tab page.
-* `LOW_RENDERING_URL`: Clock page used by low-rendering mode; defaults to `https://time.is/`.
-* `PROJECT_NAMESPACE`: Variable prefix selector (e.g. `WATERFALL` or `DEV`).
+Edit `.env` and set at least:
 
-To use Proxmox VM IPs instead of AWS Terraform outputs, set `IP_SOURCE=proxmox` in `.env`. Configure `PROXMOX_IP`, `TOKEN_ID`, and `SECRET` there; `TOKEN_ID` should use Proxmox's `user@realm!token-id` format and needs `VM.GuestAgent.Unrestricted` permission for guest commands. Proxmox requests currently use `verify=False` for self-signed lab certificates, which disables TLS certificate verification and should only be used on a trusted network; rotate the API token if it has been exposed. Keep `IP_SOURCE=terraform` (the default) to use AWS. VM names must contain `hera` as a separate word for clients or `asset` as a separate word for assets; each VM must be running with the QEMU Guest Agent enabled and report an IPv4 address. Proxmox client VMs also need PsExec at `C:\Windows\System32\PsExec.exe`, an active Windows session 1, and the Tauri executable at `C:\Program Files\hera-client\tauri-client-app.exe`. Setup and local account deletion run as the Windows desktop user, not as SYSTEM, and setup is successful only when that user's Tauri database contains the new account. If nobody is logged into the console, the script logs on with the VM account password and runs the command in that user profile. `CLIENT_PASS` is tried first; other configured lab passwords are tried if that logon is rejected. Login opens Tauri as that same desktop user in session 1. Do not launch it from the guest agent as SYSTEM; WebView2 then fails because it tries to write under `C:\\Windows\\System32\\config\\systemprofile`. By default, the login URL is built as `{API_SCHEME}://{<PROJECT_NAMESPACE>_SERVER_IP}:{<PROJECT_NAMESPACE>_API_PORT}/hera-web`; set `HERA_WEB_URL` to override it. Web login and user creation stay on `<PROJECT_NAMESPACE>_SERVER_IP` (RX-In). The site certificate on that server currently has SAN `10.101.28.42`, and the client stores each account under that certificate address. `--auto-login` must use that stored address as the lookup key, or the window reports `No account found`. The page it opens is still `{API_SCHEME}://<RX-In>:<API_PORT>/hera-web`. A desktop SSH tunnel is only for a workstation outside this subnet and is not used by the clients.
+```dotenv
+IP_SOURCE=proxmox
+PROXMOX_IP=your-proxmox-host
+TOKEN_ID=your_user@pam!your_token_id
+SECRET=your_proxmox_api_token_secret
 
-Discovery writes the full ordered client/asset inventory to the gitignored `load_test_ip_lists.json`. Each setup appends its exact client, asset, email, and display-name assignments; only successfully created pairs are eligible for Proxmox teardown. Partial teardown records remain available for retry, so teardown does not reconstruct accounts from a changing IP list.
+PROJECT_NAMESPACE=WATERFALL
+WATERFALL_SERVER_IP=your-hera-api-address
+WATERFALL_API_PORT=31643
+WATERFALL_MTLS_PORT=31888
 
----
+CLIENT_USERNAME=Administrator
+CLIENT_PASS=your-windows-client-password
+ACCOUNT_PASS=your-generated-test-account-password
+ACCOUNT_FIRST_NAME=Load
+ACCOUNT_LAST_NAME=Test
+ACCOUNT_EMAIL_USER=loadtest
+ACCOUNT_EMAIL_DOMAIN=example.invalid
 
-## Step 2 — Provision Infrastructure via Terraform
-
-1. Initialize Terraform (downloads provider plugins):
-   ```bash
-   terraform init
-   ```
-2. Apply the configuration to spin up machines (override the defaults via variables if needed):
-   ```bash
-   terraform apply -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
-   ```
-   *Type `yes` when prompted.*
-
----
-
-## Step 3 — Run the Load Tests
-
-Execute the interactive test suite control script:
-```bash
-python3.12 load_test.py
+ASSET_NAME=LoadTestAsset
+ASSET_PROTOCOL=rdp
+ASSET_PORT=3389
+ASSET_USER=your-asset-user
+ASSET_PASS=your-asset-password
+ADMIN_CREDENTIALS=your-hera-admin:your-hera-admin-password
 ```
 
-### Script Menu Options:
-* **Option 1 (Run client setup)**: Prompts for the number of client VMs, then assigns assets according to `CLIENT_ASSETS_FACTOR`. Commands run over SSH for AWS or QEMU Guest Agent for Proxmox. Setup exports the TX certificate through the selected client transport, then uploads it to the TX host over SSH and rehashes the certificate folder.
-* **Option 2 (Run client login)**: Prompts for a client count; pressing Enter reuses the count chosen during setup. It launches Tauri in Windows session 1 using PsExec with `--auto-login` and `--url` parameters, opens the configured rendering workload on the assigned Proxmox asset, then retries failed account-to-asset connections once.
-* **Option 3 (Close client apps)**: Prompts for a client count; Enter reuses the setup count. It closes Tauri and its child mTLS proxy processes while keeping Hera users, assets, and certificates intact.
-* **Option 4 (Run client teardown)**: Prompts for a client count; Enter reuses the setup count, or defaults to one client if no setup count is remembered. It deletes generated accounts/assets, removes TX certificates, then closes those client apps. Type `all` to operate on every discovered client.
-* **Option 5 (Exit)**: Exits the menu; optionally runs teardown before exiting.
+Replace example values with credentials and addresses for your own lab. Do not commit `.env`.
 
----
+`PROJECT_NAMESPACE` selects the server/API settings: with `WATERFALL`, the script reads `WATERFALL_SERVER_IP`, `WATERFALL_API_PORT`, and `WATERFALL_MTLS_PORT`; with `DEV`, it reads the corresponding `DEV_*` values.
 
-## Step 4 — Tear Down Resources
+If Proxmox assets use a different Windows account from the client, set both `PROXMOX_ASSET_USER` and `PROXMOX_ASSET_PASS`. Otherwise, the runner uses the client desktop username and configured client password for Proxmox asset connections.
 
-To avoid ongoing AWS charges, terminate all infrastructure resources:
+### 3. Start the runner
+
+From the repository directory, with the virtual environment active:
+
+```bash
+python load_test.py
+```
+
+Choose **Run client setup** first. Setup discovers the VMs, creates accounts and assets, and records successful assignments in `load_test_ip_lists.json`. Then choose **Run client login** to use those recorded Proxmox assignments.
+
+## AWS and Terraform
+
+Choose this path when Terraform should provision EC2 instances. Set `IP_SOURCE=terraform` (the default) in `.env`.
+
+### 1. Prepare AWS settings and images
+
+- Configure AWS provider credentials and select the intended region.
+- Review the AMI IDs, instance types, key pair, and counts in [`main.tf`](./main.tf).
+- Prepare a Windows client AMI containing the HERA Tauri client, PsExec, and the required Windows/graphics setup.
+- Prepare an asset AMI suitable for the asset protocol and workload you plan to test.
+- Make sure the runner can reach client SSH and that clients can reach the HERA server and assets.
+
+The Terraform configuration's current defaults create `g5.xlarge` clients and `t3.large` assets. Adjust these and the AMIs for your environment before provisioning.
+
+### 2. Provide the Windows administrator password
+
+Terraform needs the sensitive `client_password` input. `.env` is read by the Python runner; Terraform does **not** load it automatically. Set `TF_VAR_client_password` in your shell or use another protected Terraform variable mechanism. Avoid putting passwords directly in command-line arguments or committing them to a `.tfvars` file.
+
+For example, in Bash, enter the password without echoing it:
+
+```bash
+read -rsp "Windows client password: " TF_VAR_client_password
+echo
+export TF_VAR_client_password
+```
+
+### 3. Provision the instances
+
+```bash
+terraform init
+terraform plan -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
+terraform apply -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
+```
+
+After Terraform operations that need the password, remove it from the current shell with `unset TF_VAR_client_password`.
+
+After provisioning, configure `.env` with `CLIENT_USERNAME`, `CLIENT_PASS`, the HERA server settings, and account/asset details. Then run `python load_test.py` and use the interactive menu.
+
+To remove the EC2 infrastructure after cleaning up test data:
+
 ```bash
 terraform destroy -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
 ```
-> **Warning:** Make sure to pass the same region and count parameters that you used during `terraform apply`.
 
----
+Use the same region and resource parameters as for `terraform apply`. Review Terraform's destroy plan before confirming.
 
-## Deep Dive: EC2, AMIs, and Security Groups
+## Configuration reference
 
-This section details how the AWS instances are configured, how to build your own AMIs, and how to manage security groups safely.
+The complete example is in [`.env.example`](./.env.example). These are the main settings:
 
-### 1. EC2 Instance Selection
-* **Clients (`g5.xlarge`)**: Windows Tauri client applications are GPU-accelerated and require graphics resources to launch successfully. The `g5.xlarge` instance class provides NVIDIA A10G GPUs, enabling proper rendering of Tauri's Webview2 frame.
-* **Assets (`t3.large`)**: Assets act as connection targets (RDP/SSH hosts) and do not run heavy client applications, so lighter compute-optimized/burstable general-purpose instances like `t3.large` are selected to save costs.
+| Setting | Purpose |
+|---|---|
+| `IP_SOURCE` | `proxmox` or `terraform`; defaults to `terraform`. |
+| `PROXMOX_IP`, `TOKEN_ID`, `SECRET` | Proxmox host and API token. Required for Proxmox discovery and guest commands. |
+| `PROJECT_NAMESPACE` | Chooses the prefix for the server, API-port, and mTLS-port environment variables. |
+| `<NAMESPACE>_SERVER_IP` | HERA API/server address used for account setup. |
+| `<NAMESPACE>_API_PORT`, `<NAMESPACE>_MTLS_PORT` | Ports passed to the Tauri client. |
+| `CLIENT_SITE_IP` | Optional account lookup address for AWS login; defaults to `<NAMESPACE>_SERVER_IP`. Use the address the client account is stored under if it differs. Proxmox login reads this address from the local account database. |
+| `API_SCHEME`, `HERA_WEB_URL` | Web URL settings. `HERA_WEB_URL` overrides the generated/default web URL. |
+| `CLIENT_USERNAME`, `CLIENT_PASS` | Windows client login/SSH credentials. Proxmox may also try other configured lab passwords if the first credential is rejected. |
+| `ACCOUNT_PASS`, `ACCOUNT_FIRST_NAME`, `ACCOUNT_LAST_NAME` | Password and names used for generated test accounts. |
+| `ACCOUNT_EMAIL_USER`, `ACCOUNT_EMAIL_DOMAIN` | Email prefix and domain. The runner appends an incrementing number to the prefix. Use an address range/domain safe for your test environment. |
+| `ASSET_NAME`, `ASSET_PROTOCOL`, `ASSET_PORT` | Base asset display name and connection protocol/port. Generated assets receive a numbered suffix. |
+| `ASSET_USER`, `ASSET_PASS` | Credentials used for assets in the standard/AWS path; also the fallback credentials for Proxmox assets. |
+| `PROXMOX_ASSET_USER`, `PROXMOX_ASSET_PASS` | Optional Proxmox-specific asset credentials; set both to use this pair. |
+| `CLIENT_ASSETS_FACTOR` | Assets assigned per client. `0` or a negative value means one; a positive value requests that many per client. If there are too few assets, they are reused; extras are left unused. |
+| `ASSET_RENDERING_MODE` | Proxmox login workload: `low` opens `LOW_RENDERING_URL`, `high` opens `HIGH_RENDERING_URL`, and `off` skips asset rendering. |
+| `LOW_RENDERING_URL`, `HIGH_RENDERING_URL` | URLs opened in Edge for the corresponding rendering mode. |
+| `MTLS_ISSUE_SLEEP_TIME` | AWS login delay between commands to allow the local mTLS proxy to recover; default in `.env.example` is 9 seconds. Proxmox login instead waits for the guest-agent/proxy checks. |
+| `ADMIN_CREDENTIALS` | HERA admin credentials in `username:password` form for cleanup and existing-user checks. |
 
----
+Optional TX certificate upload settings are described in [Optional TX certificate upload](#optional-tx-certificate-upload). Terraform also requires `TF_VAR_client_password` independently of `.env`.
 
-### How to Create Custom AMIs
+## Run the automation
 
-To avoid setting up dependencies (like installing the Tauri Client App, configuring drivers, and setting registry values) every time you boot an instance, you should capture configured machines into custom AMIs.
+The interactive menu in `load_test.py` has these actions:
 
-#### A. Creating a Windows Tauri Client AMI
-1. **Launch a clean base instance**: Start a Windows Server 2022 instance (e.g. `g5.xlarge`) on AWS.
-2. **Install NVIDIA Drivers**: Install the matching NVIDIA grid/gaming drivers so the GPU is recognized.
-3. **Configure Tauri Client**:
-   * Create the folder `C:\Program Files\hera-client\`.
-   * Place the `tauri-client-app.exe` binary in it.
-4. **Install Sysinternals PsExec**:
-   * Place `psexec.exe` in `C:\Windows\System32\` or a folder in your System PATH so it can be called globally.
-5. **Configure Sysprep / AutoLogon** (Optional but recommended):
-   * Run the Sysprep utility or configure Windows Winlogon registry keys to automatically sign in the `Administrator` user on startup (this initializes the GUI desktop session needed for PsExec's `-i 2` parameter).
-6. **Create the AMI on AWS Console**:
-   * Right-click your running client instance -> **Image and templates** -> **Create image**.
-   * Give it a name (e.g., `Hera-Windows-Client-v1`) and click create.
-   * Copy the resulting **AMI ID** (e.g., `ami-0d67...`) and set it as `ami_id_client` in `main.tf`.
+1. **Run client setup** — Creates numbered HERA accounts and asset records on the selected clients. If TX upload is configured, setup also exports and uploads the certificate.
+2. **Run client login** — Opens Tauri and starts the account-to-asset connection. In Proxmox mode it uses assignments recorded by the latest setup run and retries failed logins and rendering once. In AWS mode it retries the launch once if the local mTLS proxy does not start.
+3. **Close client apps** — Stops Tauri and its mTLS proxy on selected clients. It keeps accounts, assets, and certificates.
+4. **Run client teardown** — Deletes generated web users/assets, local Tauri accounts, and configured TX certificates, then closes the clients.
+5. **Exit** — Exits the menu and offers an optional teardown.
 
-#### B. Creating a Linux Asset AMI
-1. Launch a general Linux instance (e.g., Ubuntu/Rocky Linux).
-2. Install RDP host (`xrdp`) or ensure SSH server is running.
-3. Right-click the instance -> **Image and templates** -> **Create image**.
-4. Save the resulting **AMI ID** and set it as `ami_id_asset` in `main.tf`.
+At the client-count prompt, enter a positive number to limit work or `all` to select all applicable clients. Press Enter to accept the prompt's displayed default. Login and close reuse the last setup count when available; teardown defaults to that count, or to one client if no setup count has been selected.
 
----
+The runner processes assignments sequentially. For Proxmox, login and rendering require additional guest-agent and Windows-session checks, so startup and retry times depend on the VMs and workload.
 
-### Choosing & Managing Security Groups (SG)
+## Setup inventory and recovery
 
-Security Groups act as a virtual firewall for your EC2 instances to control inbound and outbound traffic.
+The runner writes `load_test_ip_lists.json` in the repository directory. This gitignored file stores the discovered VM inventory and setup assignments, including client/asset IPs, generated email addresses, and operation statuses.
 
-#### Required Inbound Ports:
-* **Port `3389` (RDP)**: Required for Windows Client GUI visualization, RDP target connections for assets, and manual administrator logons.
-* **Port `22` (SSH)**: Required by the `load_test.py` script to connect to the client machines and trigger Tauri/PsExec command lines.
+- Keep this file between setup, login, and teardown. Proxmox login depends on the latest setup records.
+- Proxmox teardown uses only recorded successful or partially completed assignments. If the inventory is missing or unreadable, it refuses broad teardown instead of guessing which accounts to delete.
+- Proxmox teardown continues to the next assignment when a cleanup operation fails, including guest-agent failures during local account deletion. It saves per-step results and errors after each assignment; failed or unconfirmed cleanup is marked `teardown_partial` and remains available for a later retry.
+- After closing the selected clients, teardown prints a cleanup summary for the selected assignments: VM IP/VMID/node, cleaned and attention-needed counts, and the accounts/assets and failed steps requiring manual cleanup. These are cleanup results, not a general VM-health check. Review the separate client-close output for shutdown failures.
+- The inventory can contain internal addresses and test-account details. Keep it private and back it up securely if you need recovery after a runner-machine failure.
 
-#### Restricting Access (Best Practices):
-In `main.tf`, the default security group rule allows traffic from anywhere:
-```hcl
-ingress {
-  from_port   = 3389
-  to_port     = 3389
-  protocol    = "tcp"
-  cidr_blocks = ["0.0.0.0/0"] # Open to the world
-}
+AWS teardown does not use the Proxmox setup manifest in the same way. Check the generated account and asset selection carefully before running cleanup.
+
+## Optional TX certificate upload
+
+To copy the External IP client certificate to a TX host after setup, configure:
+
+```dotenv
+TX_HOST=your-tx-host
+TX_SSH_USER=your-ssh-user
+TX_CERT_FOLDER=/path/to/mtls/certificates
 ```
 
-> **Security Warning:** Leaving RDP (`3389`) and SSH (`22`) open to `0.0.0.0/0` exposes your test instances to brute-force attacks. 
+Provide either `TX_SSH_KEY` or `TX_SSH_PASS`, and optionally set `TX_SSH_PORT` (default `22`) and `TX_REHASH_COMMAND`. If `TX_HOST` or `TX_CERT_FOLDER` is empty, upload is skipped. When configured, the runner uploads the certificate over SSH/SFTP and rebuilds the OpenSSL hash links.
 
-To secure your deployment:
-1. **Restrict CIDR to your specific IP address**:
-   Replace `["0.0.0.0/0"]` with your specific corporate or local public IP subnet (e.g., `["203.0.113.50/32"]`).
-2. **Restrict Client-to-Asset communication**:
-   Instead of opening port `3389` to the whole world, you can set the asset's security group to only accept incoming connections originating from the Security Group ID of the Client instances.
+## Troubleshooting
+
+| Symptom | Things to check |
+|---|---|
+| No clients/assets found | Check `IP_SOURCE`. For Proxmox, confirm VMs are running QEMU VMs with names containing exactly one recognized marker (`hera` or `asset`), a working guest agent, and a reported IPv4 address. For Terraform, run `terraform output -json` in this repository after applying. |
+| Proxmox API or guest-agent errors | Check API reachability, token ID/secret, VM permissions, and that the guest agent service is running inside the VM. |
+| Setup/login cannot find Tauri or PsExec | Confirm the exact Windows paths in the Proxmox requirements and that the client AMI/image has finished starting. |
+| Account setup is reported unsuccessful | Check the HERA API settings and credentials. In Proxmox, setup must write the account to the logged-in desktop user's Tauri database; ensure a valid desktop/logon account and profile. |
+| Login says no account was found | Confirm setup succeeded and the lookup address matches the address stored for that account. Set `CLIENT_SITE_IP` for the AWS path when it differs from the server IP; Proxmox reads the stored address from the local database. |
+| Proxmox login has no desktop or rendering fails | Confirm Windows desktop sessions can be opened. Rendering also needs a Windows asset VM with the guest agent, an active HERA session, and Edge; use `ASSET_RENDERING_MODE=off` if rendering is not part of the test. |
+| TX upload fails | Verify TX host SSH access, key/password, remote certificate folder ownership/permissions, and the configured rehash command. |
+| Terraform cannot create instances | Check AWS credentials/permissions, region and AMI availability, key-pair name, account service quotas, and the `terraform plan` output. |
+
+The script prints per-operation errors and summaries. Resolve the reported cause before retrying setup or teardown; avoid rerunning setup blindly if accounts may already have been created.
+
+## Security notes
+
+- Keep `.env`, Terraform state, generated inventory, and credentials out of version control. Terraform state can contain sensitive values; protect it accordingly.
+- The current Proxmox API calls disable TLS certificate verification (`verify=False`). Use this only on a trusted lab network. Although `PROXMOX_CA_CERT` appears in the example environment file, the current script does not use it to verify the Proxmox certificate.
+- The AWS security group in `main.tf` currently allows inbound RDP (`3389`) and SSH (`22`) from `0.0.0.0/0`. Restrict inbound access to trusted source addresses and required client-to-asset traffic before applying it in a shared or internet-connected environment.
+- The Terraform client bootstrap configures Windows auto-logon with the administrator password. Treat the value and resulting Terraform state as sensitive; use short-lived test infrastructure and rotate credentials as appropriate.
+- Review both Terraform plans and cleanup targets before confirming destructive actions.
