@@ -3,7 +3,12 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-import load_test
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+import load_test  # noqa: E402
 
 # Output captured from a real failed Edge launch; PowerShell wraps every line in NativeCommandError.
 EDGE_NOISE = r"""powershell.exe : Edge did not stay open on the asset.
@@ -131,18 +136,19 @@ class LoginRetryScopeTests(unittest.TestCase):
         with patch("builtins.input", side_effect=answers), redirect_stdout(output):
             return load_test._ask_login_retry_scope(records, "low"), output.getvalue()
 
-    def test_mixed_results_default_to_retry_only_failed(self):
+    def test_mixed_results_default_to_a_fresh_count_run(self):
         result, output = self.ask(self.records("ok", "ok", "render_failed", "login_failed"), [""])
-        self.assertTrue(result)
-        self.assertIn("2 VM(s) logged in correctly, 2 failed", output)
-
-    def test_user_can_choose_to_log_in_all_again(self):
-        result, _output = self.ask(self.records("ok", "login_failed"), ["2"])
         self.assertFalse(result)
+        self.assertIn("2 logged in and 2 failed", output)
+        self.assertIn("restarted since", output)
+
+    def test_user_can_choose_to_reuse_results_and_retry_failed(self):
+        result, _output = self.ask(self.records("ok", "login_failed"), ["2"])
+        self.assertTrue(result)
 
     def test_invalid_answer_is_asked_again(self):
         result, output = self.ask(self.records("ok", "login_failed"), ["x", "1"])
-        self.assertTrue(result)
+        self.assertFalse(result)
         self.assertIn("Invalid input", output)
 
     def test_no_question_when_nothing_to_choose(self):

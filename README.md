@@ -9,6 +9,7 @@ The Python runner is interactive. It creates accounts and asset assignments in H
 
 ## Contents
 
+- [Project layout](#project-layout)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Proxmox: prepare and run](#proxmox-prepare-and-run)
@@ -19,6 +20,23 @@ The Python runner is interactive. It creates accounts and asset assignments in H
 - [Optional TX certificate upload](#optional-tx-certificate-upload)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
+
+## Project layout
+
+```text
+load_test.py            launcher: run `python load_test.py` from this folder
+requirements.txt        Python dependencies
+.env / .env.example     your settings (the real .env is never committed)
+load_test_ip_lists.json generated inventory of VMs and accounts (never committed)
+src/
+  load_test.py          the interactive runner
+  server_cleanup.py     deletes test users and assets through the HERA API
+  tx_cert_upload.py     optional TX certificate upload
+  aws/                  Terraform for the AWS path: main.tf, open_rdp.ps1, state and variables
+tests/                  unit tests
+```
+
+Run the tests from this folder with `python -m unittest discover -s tests`.
 
 ## How it works
 
@@ -54,7 +72,7 @@ Create a virtual environment and install the Python dependencies:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install paramiko requests
+python -m pip install -r requirements.txt
 ```
 
 On Windows, activate the virtual environment with `.venv\Scripts\activate` instead of the `source` command.
@@ -147,7 +165,7 @@ Choose this path when Terraform should provision EC2 instances. Set `IP_SOURCE=t
 ### 1. Prepare AWS settings and images
 
 - Configure AWS provider credentials and select the intended region.
-- Review the AMI IDs, instance types, key pair, and counts in [`main.tf`](./main.tf).
+- Review the AMI IDs, instance types, key pair, and counts in [`src/aws/main.tf`](./src/aws/main.tf).
 - Prepare a Windows client AMI containing the HERA Tauri client, PsExec, and the required Windows/graphics setup.
 - Prepare an asset AMI suitable for the asset protocol and workload you plan to test.
 - Make sure the runner can reach client SSH and that clients can reach the HERA server and assets.
@@ -168,7 +186,10 @@ export TF_VAR_client_password
 
 ### 3. Provision the instances
 
+Run the Terraform commands from the `src/aws` folder, which holds `main.tf` and the Terraform state:
+
 ```bash
+cd src/aws
 terraform init
 terraform plan -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
 terraform apply -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
@@ -176,9 +197,9 @@ terraform apply -var="region=il-central-1" -var="client_instance_count=5" -var="
 
 After Terraform operations that need the password, remove it from the current shell with `unset TF_VAR_client_password`.
 
-After provisioning, configure `.env` with `CLIENT_USERNAME`, `CLIENT_PASS`, the HERA server settings, and account/asset details. Then run `python load_test.py` and use the interactive menu.
+After provisioning, configure `.env` with `CLIENT_USERNAME`, `CLIENT_PASS`, the HERA server settings, and account/asset details. Then go back to the project folder (`cd ../..`), run `python load_test.py` and use the interactive menu.
 
-To remove the EC2 infrastructure after cleaning up test data:
+To remove the EC2 infrastructure after cleaning up test data, run this in `src/aws`:
 
 ```bash
 terraform destroy -var="region=il-central-1" -var="client_instance_count=5" -var="asset_instance_count=5"
@@ -259,7 +280,7 @@ Provide either `TX_SSH_KEY` or `TX_SSH_PASS`, and optionally set `TX_SSH_PORT` (
 
 | Symptom | Things to check |
 |---|---|
-| No clients/assets found | Check `IP_SOURCE`. For Proxmox, confirm VMs are running QEMU VMs with names containing exactly one recognized marker (`hera` or `asset`), a working guest agent, and a reported IPv4 address. For Terraform, run `terraform output -json` in this repository after applying. |
+| No clients/assets found | Check `IP_SOURCE`. For Proxmox, confirm VMs are running QEMU VMs with names containing exactly one recognized marker (`hera` or `asset`), a working guest agent, and a reported IPv4 address. For Terraform, run `terraform output -json` in `src/aws` after applying. |
 | Proxmox API or guest-agent errors | Check API reachability, token ID/secret, VM permissions, and that the guest agent service is running inside the VM. |
 | Setup/login cannot find Tauri or PsExec | Confirm the exact Windows paths in the Proxmox requirements and that the client AMI/image has finished starting. |
 | Account setup is reported unsuccessful | Check the HERA API settings and credentials. In Proxmox, setup must write the account to the logged-in desktop user's Tauri database; ensure a valid desktop/logon account and profile. |
@@ -274,6 +295,6 @@ The script prints per-operation errors and summaries. Resolve the reported cause
 
 - Keep `.env`, Terraform state, generated inventory, and credentials out of version control. Terraform state can contain sensitive values; protect it accordingly.
 - The current Proxmox API calls disable TLS certificate verification (`verify=False`). Use this only on a trusted lab network. Although `PROXMOX_CA_CERT` appears in the example environment file, the current script does not use it to verify the Proxmox certificate.
-- The AWS security group in `main.tf` currently allows inbound RDP (`3389`) and SSH (`22`) from `0.0.0.0/0`. Restrict inbound access to trusted source addresses and required client-to-asset traffic before applying it in a shared or internet-connected environment.
+- The AWS security group in `src/aws/main.tf` currently allows inbound RDP (`3389`) and SSH (`22`) from `0.0.0.0/0`. Restrict inbound access to trusted source addresses and required client-to-asset traffic before applying it in a shared or internet-connected environment.
 - The Terraform client bootstrap configures Windows auto-logon with the administrator password. Treat the value and resulting Terraform state as sensitive; use short-lived test infrastructure and rotate credentials as appropriate.
 - Review both Terraform plans and cleanup targets before confirming destructive actions.

@@ -6,7 +6,12 @@ from unittest.mock import patch
 
 import requests
 
-import load_test
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+import load_test  # noqa: E402
 
 SETTINGS = {
     "ip_source": "proxmox",

@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-import load_test
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+import load_test  # noqa: E402
 
 
 def response(status_code=200, text="", json_data=None):
@@ -22,6 +27,30 @@ def response(status_code=200, text="", json_data=None):
 
 FILE_BLOCKED = "Agent error: Command guest-file-open has been disabled: the command is not allowed"
 AGENT_DOWN = "QEMU guest agent is not running"
+
+
+class ProxmoxHelperTests(unittest.TestCase):
+    def test_api_base_uses_configured_ip(self):
+        self.assertEqual(
+            load_test._proxmox_api_base({"proxmox_ip": "10.0.0.9"}),
+            "https://10.0.0.9:8006/api2/json",
+        )
+
+    def test_api_base_falls_back_to_the_default_ip(self):
+        self.assertEqual(
+            load_test._proxmox_api_base({"proxmox_ip": ""}),
+            f"https://{load_test.DEFAULT_PROXMOX_IP}:8006/api2/json",
+        )
+
+    def test_headers_build_the_api_token(self):
+        headers = load_test._proxmox_headers({"proxmox_token_id": "u@pve!t", "proxmox_token_secret": "sec"})
+        self.assertEqual(headers, {"Authorization": "PVEAPIToken=u@pve!t=sec"})
+
+    def test_encode_ps_command_is_utf16le_base64(self):
+        import base64
+        encoded = load_test._encode_ps_command("Write-Output 'hi'")
+        self.assertEqual(base64.b64decode(encoded).decode("utf-16le"), "Write-Output 'hi'")
+
 
 
 class QaReportedMessagesTests(unittest.TestCase):
@@ -239,16 +268,26 @@ class LoginRunResilienceTests(unittest.TestCase):
                        retry_failed_only=False)
         self.assertEqual(seen, ["c1", "c2"])
 
-    def test_new_accounts_only_when_the_earlier_ones_already_logged_in(self):
+    def test_default_choice_runs_a_fresh_count_based_selection(self):
+        # Enter now means "log in a chosen number of VMs", regardless of previous results.
+        records = [self.record(1, login_status="connected"), self.record(2)]
+        inventory = {"source": "proxmox", "setup_runs": [{"source": "proxmox", "assignments": records}]}
+        seen = []
+        with patch("builtins.input", return_value=""):
+            self.run_login(inventory, lambda _s, ip, _c: seen.append(ip) or ("", "", 0, False),
+                           ask_client_limit=lambda: 1)
+        self.assertEqual(seen, ["c1"])
+
+    def test_option_two_reuses_results_and_skips_the_connected_vms(self):
         done = self.record(1, login_status="connected")
         new = self.record(2)
         inventory = {"source": "proxmox", "setup_runs": [{"source": "proxmox", "assignments": [done, new]}]}
         seen = []
 
         def no_prompt():
-            raise AssertionError("the client count must not be asked when only new VMs are logged in")
+            raise AssertionError("the client count must not be asked when reusing previous results")
 
-        with patch("builtins.input", return_value=""):
+        with patch("builtins.input", return_value="2"):
             self.run_login(inventory, lambda _s, ip, _c: seen.append(ip) or ("", "", 0, False),
                            ask_client_limit=no_prompt)
         self.assertEqual(seen, ["c2"])
