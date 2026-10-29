@@ -194,6 +194,8 @@ The complete example is in [`.env.example`](./.env.example). These are the main 
 |---|---|
 | `IP_SOURCE` | `proxmox` or `terraform`; defaults to `terraform`. |
 | `PROXMOX_IP`, `TOKEN_ID`, `SECRET` | Proxmox host and API token. Required for Proxmox discovery and guest commands. |
+| `PROXMOX_EXCLUDE_VMS` | Optional comma-separated VM names, VM IDs, or IPs that discovery must skip, e.g. a personal VM whose name contains `hera` or `asset`. |
+| `PROXMOX_VM_NAME_PREFIX` | Optional. When set (e.g. `win11`), discovery only uses VMs whose name starts with it and skips all others. |
 | `PROJECT_NAMESPACE` | Chooses the prefix for the server, API-port, and mTLS-port environment variables. |
 | `<NAMESPACE>_SERVER_IP` | HERA API/server address used for account setup. |
 | `<NAMESPACE>_API_PORT`, `<NAMESPACE>_MTLS_PORT` | Ports passed to the Tauri client. |
@@ -217,21 +219,23 @@ Optional TX certificate upload settings are described in [Optional TX certificat
 
 The interactive menu in `load_test.py` has these actions:
 
-1. **Run client setup** — Creates numbered HERA accounts and asset records on the selected clients. If TX upload is configured, setup also exports and uploads the certificate.
-2. **Run client login** — Opens Tauri and starts the account-to-asset connection. In Proxmox mode it uses assignments recorded by the latest setup run and retries failed logins and rendering once. In AWS mode it retries the launch once if the local mTLS proxy does not start.
+1. **Run client setup** — Creates numbered HERA accounts and asset records on the selected clients. If TX upload is configured, setup also exports and uploads the certificate. In Proxmox mode setup is incremental: clients that already have an account are left unchanged and keep their number, and only clients without one get new accounts, numbered from the lowest free number (numbers used by existing HERA users are skipped and listed). To add clients to an existing configuration, add the VMs and run setup again with the new total client count. A recorded account that no longer exists on the HERA server is created again.
+2. **Run client login** — Opens Tauri and starts the account-to-asset connection for every account recorded as created, from all setup runs. In Proxmox mode it retries failed logins and rendering once. If a previous login run left some VMs failed or never logged in while others are connected, it first asks whether to log in **only the VMs that are not logged in yet** (recommended; failed ones plus newly added accounts, and no client count is asked) or all VMs again. A failure on one VM never stops the run for the remaining VMs. Failures are listed at the end in plain language, and the raw technical detail is kept in `load_test_ip_lists.json` (`login_detail`, `asset_render_detail`). In AWS mode it retries the launch once if the local mTLS proxy does not start.
 3. **Close client apps** — Stops Tauri and its mTLS proxy on selected clients. It keeps accounts, assets, and certificates.
 4. **Run client teardown** — Deletes generated web users/assets, local Tauri accounts, and configured TX certificates, then closes the clients.
 5. **Exit** — Exits the menu and offers an optional teardown.
 
-At the client-count prompt, enter a positive number to limit work or `all` to select all applicable clients. Press Enter to accept the prompt's displayed default. Login and close reuse the last setup count when available; teardown defaults to that count, or to one client if no setup count has been selected.
+At the client-count prompt, enter a positive number to limit work or `all` to select all applicable clients. Press Enter to accept the prompt's displayed default. Login and close reuse the last setup count when available; teardown defaults to that count, or to one client if no setup count has been selected. For setup, the count is the total number of clients that should have accounts, including ones that already do.
 
 The runner processes assignments sequentially. For Proxmox, login and rendering require additional guest-agent and Windows-session checks, so startup and retry times depend on the VMs and workload.
+
+Temporary Proxmox guest-agent problems ("agent is not running", "command has been disabled") are retried automatically a few times before a VM is reported as failed. VMs whose guest agent does not report an IP address during discovery are listed in a warning at the end of discovery instead of silently disappearing. Every message shown during a run is meant for QA and says what to check; the raw technical text is kept in the inventory file.
 
 ## Setup inventory and recovery
 
 The runner writes `load_test_ip_lists.json` in the repository directory. This gitignored file stores the discovered VM inventory and setup assignments, including client/asset IPs, generated email addresses, and operation statuses.
 
-- Keep this file between setup, login, and teardown. Proxmox login depends on the latest setup records.
+- Keep this file between setup, login, and teardown. Proxmox login uses every account recorded as created, across all setup runs, and incremental setup depends on those records to keep numbering stable.
 - Proxmox teardown uses only recorded successful or partially completed assignments. If the inventory is missing or unreadable, it refuses broad teardown instead of guessing which accounts to delete.
 - Proxmox teardown continues to the next assignment when a cleanup operation fails, including guest-agent failures during local account deletion. It saves per-step results and errors after each assignment; failed or unconfirmed cleanup is marked `teardown_partial` and remains available for a later retry.
 - After closing the selected clients, teardown prints a cleanup summary for the selected assignments: VM IP/VMID/node, cleaned and attention-needed counts, and the accounts/assets and failed steps requiring manual cleanup. These are cleanup results, not a general VM-health check. Review the separate client-close output for shutdown failures.

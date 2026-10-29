@@ -126,6 +126,12 @@ def _read_load_test_settings():
             "proxmox_token_id": os.environ.get('TOKEN_ID', ''),
             "proxmox_token_secret": os.environ.get('SECRET', ''),
             "proxmox_ca_cert": os.environ.get('PROXMOX_CA_CERT', ''),
+            "proxmox_name_prefix": os.environ.get('PROXMOX_VM_NAME_PREFIX', '').strip().strip('"').strip("'").lower(),
+            "proxmox_exclude_vms": {
+                item.strip().strip('"').strip("'").lower()
+                for item in os.environ.get('PROXMOX_EXCLUDE_VMS', '').split(',')
+                if item.strip()
+            },
         }
         # ASSET_USER/ASSET_PASS stay for EC2; Proxmox assets use their own pair.
         proxmox_asset_user = os.environ.get('PROXMOX_ASSET_USER', '').strip()
@@ -206,9 +212,19 @@ def _get_proxmox_ips(settings):
     ]
     running_vms.sort(key=lambda vm: vm.get("node", ""))
 
+    excluded = {str(item).lower() for item in settings.get("proxmox_exclude_vms", ())}
+    name_prefix = str(settings.get("proxmox_name_prefix", "") or "").lower()
+    skipped_vms = []
+    ignored_count = 0
     for vm in running_vms:
         name = str(vm.get("name", ""))
         vm_name = name.lower()
+        if name_prefix and not vm_name.startswith(name_prefix):
+            ignored_count += 1
+            continue
+        if vm_name in excluded or str(vm.get("vmid", "")) in excluded:
+            ignored_count += 1
+            continue
         is_client = re.search(r"(^|[^a-z0-9])hera([^a-z0-9]|$)", vm_name) is not None
         is_asset = re.search(r"(^|[^a-z0-9])asset([^a-z0-9]|$)", vm_name) is not None
         if is_client == is_asset:
@@ -216,16 +232,25 @@ def _get_proxmox_ips(settings):
 
         node = quote(str(vm.get("node", "")), safe="")
         vmid = quote(str(vm.get("vmid", "")), safe="")
-        try:
-            result_data = request_json(
-                f"nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
-            ).get("data", {}).get("result", [])
-        except Exception as exc:
-            print(f"Could not read guest-agent IP for VM '{name}': {exc}")
-            continue
+        result_data = None
+        read_error = None
+        # The guest agent can answer late right after boot or under load, so ask a few times.
+        for attempt in range(3):
+            try:
+                result_data = request_json(
+                    f"nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+                ).get("data", {}).get("result", [])
+                read_error = None
+            except Exception as exc:
+                result_data = None
+                read_error = exc
+            if isinstance(result_data, list):
+                break
+            if attempt < 2:
+                time.sleep(3)
 
         if not isinstance(result_data, list):
-            print(f"Guest agent is not ready for VM '{name}'.")
+            skipped_vms.append(name)
             continue
 
         vm_ip = None
@@ -248,9 +273,11 @@ def _get_proxmox_ips(settings):
                 break
 
         if not vm_ip:
-            print(f"No usable IPv4 address reported by the guest agent for VM '{name}'.")
+            skipped_vms.append(name)
             continue
-
+        if vm_ip in excluded:
+            ignored_count += 1
+            continue
         settings["proxmox_vms_by_ip"][vm_ip] = {
             "node": str(vm.get("node", "")),
             "vmid": int(vm.get("vmid", 0)),
@@ -258,7 +285,14 @@ def _get_proxmox_ips(settings):
         }
         (client_ips if is_client else asset_ips).append(vm_ip)
 
-    print(f"Discovered {len(client_ips)} Hera client(s) and {len(asset_ips)} asset(s) from Proxmox.")
+    ignored_note = f" ({ignored_count} other VM(s) ignored)" if ignored_count else ""
+    print(f"Discovered {len(client_ips)} Hera client(s) and {len(asset_ips)} asset(s) from Proxmox{ignored_note}.")
+    if skipped_vms:
+        print(
+            f"WARNING: {len(skipped_vms)} VM(s) were left out because their guest agent did not answer: "
+            f"{', '.join(skipped_vms)}. Check that they are powered on and Windows has finished starting, "
+            "then run the step again."
+        )
     return client_ips, asset_ips
 
 
@@ -271,6 +305,22 @@ def _get_target_ips(settings):
         return _get_proxmox_ips(settings)
     print(f"Unsupported IP_SOURCE '{source}'. Choose 'terraform' or 'proxmox'.")
     return [], []
+
+
+def _is_transient_agent_error(status_code, text):
+    """Guest-agent hiccups that usually clear within seconds (agent restarting, busy, or just booted)."""
+    if status_code != 500:
+        return False
+    details = (text or "").lower()
+    return any(
+        marker in details
+        for marker in (
+            "has been disabled",
+            "failed to execute helper program",
+            "guest agent is not running",
+            "guest agent is not ready",
+        )
+    )
 
 
 def _execute_proxmox_command(settings, client_ip, command, timeout_seconds=None):
@@ -308,7 +358,8 @@ def _execute_proxmox_command(settings, client_ip, command, timeout_seconds=None)
             pass
 
     def request_agent(method, endpoint, **kwargs):
-        for attempt in range(3):
+        attempts = 4
+        for attempt in range(attempts):
             try:
                 response = requests.request(
                     method,
@@ -321,14 +372,12 @@ def _execute_proxmox_command(settings, client_ip, command, timeout_seconds=None)
                 return response
             except requests.RequestException as exc:
                 response = getattr(exc, "response", None)
-                details = (response.text if response is not None else "").lower()
-                retryable = response is not None and response.status_code == 500 and (
-                    "has been disabled" in details
-                    or "failed to execute helper program" in details
+                retryable = response is not None and _is_transient_agent_error(
+                    response.status_code, response.text
                 )
-                if not retryable or attempt == 2:
+                if not retryable or attempt == attempts - 1:
                     raise
-                time.sleep(attempt + 1)
+                time.sleep(2 * (attempt + 1))
 
     try:
         response = request_agent(
@@ -387,22 +436,33 @@ def _write_proxmox_file(settings, client_ip, remote_path, content):
             f"{settings['proxmox_token_secret']}"
         )
     }
-    for attempt in range(3):
-        response = requests.post(
-            f"{api_base}/nodes/{node}/qemu/{vmid}/agent/file-write",
-            headers=headers,
-            data={
-                "file": remote_path,
-                "content": content,
-            },
-            verify=False,
-            timeout=20,
-        )
+    attempts = 4
+    for attempt in range(attempts):
+        last_attempt = attempt == attempts - 1
+        try:
+            response = requests.post(
+                f"{api_base}/nodes/{node}/qemu/{vmid}/agent/file-write",
+                headers=headers,
+                data={
+                    "file": remote_path,
+                    "content": content,
+                },
+                verify=False,
+                timeout=20,
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            if last_attempt:
+                raise
+            time.sleep(2 * (attempt + 1))
+            continue
         # The guest agent sometimes drops the mkdir that should have created the folder.
-        if response.status_code == 500 and "cannot find the path" in response.text.lower() and attempt < 2:
+        if response.status_code == 500 and "cannot find the path" in response.text.lower() and not last_attempt:
             folder = remote_path.rsplit("\\", 1)[0]
             _execute_proxmox_command(settings, client_ip, ["cmd.exe", "/c", f"mkdir {folder}"], 15)
             time.sleep(attempt + 1)
+            continue
+        if _is_transient_agent_error(response.status_code, response.text) and not last_attempt:
+            time.sleep(2 * (attempt + 1))
             continue
         response.raise_for_status()
         return
@@ -497,27 +557,38 @@ exit 1
         ["cmd.exe", "/c", "mkdir C:\\ProgramData\\HeraLoadTest"],
         15,
     )
-    try:
-        _write_proxmox_file(settings, client_ip, remote, script)
-        output, error_output, exit_status, timed_out = _execute_proxmox_command(
-            settings, client_ip,
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", remote],
-            40,
-        )
-    finally:
-        _execute_proxmox_command(
-            settings, client_ip,
-            ["cmd.exe", "/c", "del /f /q C:\\ProgramData\\HeraLoadTest\\logon-probe.ps1"],
-            15,
-        )
-    if timed_out:
-        raise RuntimeError("Timed out while checking the Windows account password.")
-    match = re.search(r"MATCH\s+(\S+)\s+(\d+)", output or "")
-    if not match or exit_status != 0:
+    match = None
+    detail = ""
+    verdict_reached = False
+    # PowerShell sometimes fails to start on a busy VM, so a missing verdict is retried once.
+    for attempt in range(2):
+        try:
+            _write_proxmox_file(settings, client_ip, remote, script)
+            output, error_output, exit_status, timed_out = _execute_proxmox_command(
+                settings, client_ip,
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", remote],
+                40,
+            )
+        finally:
+            _execute_proxmox_command(
+                settings, client_ip,
+                ["cmd.exe", "/c", "del /f /q C:\\ProgramData\\HeraLoadTest\\logon-probe.ps1"],
+                15,
+            )
+        if timed_out:
+            raise RuntimeError("Timed out while checking the Windows account password.")
+        match = re.search(r"MATCH\s+(\S+)\s+(\d+)", output or "")
+        verdict_reached = bool(match) or "NOMATCH" in (output or "")
         detail = _readable_powershell_error(error_output) or (output or "").strip()
+        if verdict_reached:
+            break
+        if attempt == 0:
+            time.sleep(5)
+    if not verdict_reached:
+        raise RuntimeError("PowerShell could not run the password check on this VM. " + detail[:300])
+    if not match or exit_status != 0:
         raise RuntimeError(
-            "None of the configured passwords can log on to an enabled Windows account. "
-            + detail[:300]
+            "None of the configured passwords can log on to an enabled Windows account."
         )
     found = {"user": match.group(1), "password": passwords[int(match.group(2))]}
     settings["windows_logon_shared"] = found
@@ -673,6 +744,128 @@ def _readable_powershell_error(text):
     ]
     cleaned = "\n".join(line for line in decoded if line.strip())
     return cleaned or text
+
+
+class StepError(RuntimeError):
+    """A failure with a message QA can act on and the raw technical detail for developers."""
+
+    def __init__(self, message, detail=""):
+        super().__init__(message)
+        self.detail = detail
+
+
+_WRAPPER_NOISE = re.compile(
+    r"^(\+|At\s|At line:|:String\)|\s*~+)|CategoryInfo\s*:|FullyQualifiedErrorId\s*:"
+    r"|\[\],\s*\w*Exception|^(timeException|Run)$"
+)
+
+# Checked in order; the first match decides the message shown to the operator.
+_FAILURE_PATTERNS = [
+    (r"guest agent is not running",
+     "the VM's guest agent stopped responding. Check that the VM is powered on and Windows has finished starting."),
+    (r"vm \d+ is not running",
+     "the VM is powered off. Start it in Proxmox."),
+    (r"configuration file .* does not exist",
+     "the VM no longer exists in Proxmox. Run step 1 again to refresh the VM list."),
+    (r"guest-file-\w+ has been disabled",
+     "the VM's guest agent does not allow file transfers right now. Restart the VM; "
+     "if it keeps happening, ask the administrator to allow file access in the guest-agent settings."),
+    (r"has been disabled",
+     "the Proxmox guest agent is not allowed to run commands. Ask the administrator to enable it."),
+    (r"No Proxmox VM metadata",
+     "this VM is not in the saved VM list. Run step 1 again to refresh it."),
+    (r"Starting the CLR failed|80004005",
+     "PowerShell could not start on this VM. Restart the VM and try again."),
+    (r"PowerShell could not run the password check",
+     "the Windows password check could not run on this VM. Restart the VM and try again."),
+    (r"None of the configured passwords",
+     "none of the passwords in the .env file can log on to Windows on this VM. "
+     "Check CLIENT_PASS and ASSET_PASS."),
+    (r"Microsoft Edge is not installed",
+     "Microsoft Edge is not installed on the asset."),
+    (r"Edge did not (stay open|open)",
+     "Edge did not open on the asset. Check that the asset VM is responsive."),
+    (r"No interactive Windows user",
+     "nobody is logged in to Windows on the VM."),
+    (r"No desktop session appeared|did not open a session",
+     "HERA did not open a remote session on the asset."),
+    (r"could not be stopped",
+     "a previous HERA client is still running and could not be closed."),
+    (r"TpmMtlsProxy",
+     "the HERA client started, but its secure-connection component (mTLS proxy) did not start."),
+    (r"Tauri (is not visible|exited)|Tauri or TpmMtlsProxy",
+     "the HERA client window closed or did not appear."),
+    (r"Account already exists",
+     "this account already exists in the HERA client app on the VM (left over from an earlier run). "
+     "Run step 4 first, or delete it in the HERA client app."),
+    (r"user already exists|409 conflict",
+     "this user already exists on the HERA server. Run step 4 first, or delete it in the HERA UI."),
+    (r"did not print ACCOUNT SETUP SUCCESSFUL",
+     "the HERA client did not confirm the account setup. Open the HERA client app on that VM and check it."),
+    (r"live accounts:",
+     "the account was not found in the HERA client app on the VM after setup."),
+    (r"still present in the desktop",
+     "the account is still in the HERA client app on the VM. Delete it there manually."),
+    (r"delete or rehash failed",
+     "the TX server did not confirm that the certificate was deleted. Check the TX server."),
+    (r"Could not reach the Hera API",
+     "the HERA server could not be reached. Check the server address and that the server is running."),
+    (r"failed with status 5\d\d",
+     "the HERA server returned an error. Wait a minute and run step 4 again; "
+     "if it keeps failing, delete it in the HERA UI."),
+    (r"timed out",
+     "the VM did not respond in time. Check that it is running and not overloaded."),
+]
+
+
+def _clean_command_error(text):
+    """Drop PowerShell's wrapper lines (NativeCommandError, script positions) and keep the real message."""
+    lines = []
+    for raw_line in (text or "").replace("\r", "").split("\n"):
+        line = re.sub(r"^\s*powershell\.exe\s*:\s*", "", raw_line).strip()
+        if line and not _WRAPPER_NOISE.search(line) and line not in lines:
+            lines.append(line)
+    return " ".join(lines)
+
+
+def _describe_failure(subject, text):
+    """Return (message for QA, raw technical detail) for a failed step."""
+    raw = (text or "").strip()
+    prefix = f"{subject}: " if subject else ""
+    for pattern, reason in _FAILURE_PATTERNS:
+        if re.search(pattern, raw, re.IGNORECASE | re.DOTALL):
+            return f"{prefix}{reason}", raw
+    cleaned = _clean_command_error(_readable_powershell_error(raw)) or "no details were returned"
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200].rstrip() + "..."
+    return f"{prefix}unexpected problem ({cleaned}).", raw
+
+
+def _describe_exception(subject, exc):
+    """Like _describe_failure for an exception; keeps messages already written for QA."""
+    if isinstance(exc, StepError):
+        return str(exc), exc.detail or str(exc)
+    response = getattr(exc, "response", None)
+    text = str(exc)
+    if response is not None:
+        text = f"{text} {getattr(response, 'text', '')[:500]}"
+    return _describe_failure(subject, text)
+
+
+_CLEANUP_LABELS = {
+    "Client session shutdown": "Closing the HERA client",
+    "Hera API cleanup": "HERA server",
+    "TX certificate cleanup": "TX certificate",
+    "Local Tauri cleanup": "HERA client app",
+}
+
+
+def _friendly_cleanup_error(error):
+    """Turn a stored teardown error like 'Hera API cleanup: DELETE … 500' into a sentence for QA."""
+    label, separator, rest = (error or "").partition(": ")
+    if not separator or label not in _CLEANUP_LABELS:
+        return _describe_failure("", error)[0]
+    return f"{_CLEANUP_LABELS[label]}: {_describe_failure('', rest)[0]}"
 
 
 def _execute_proxmox_interactive_command(settings, client_ip, command, timeout_seconds=None, run_as_user=None):
@@ -1395,30 +1588,55 @@ def _open_asset_rendering(settings, asset_ip):
     url = settings["low_rendering_url"] if mode == "low" else settings["high_rendering_url"]
     user = _asset_session_user(settings, asset_ip)
     if not user:
-        raise RuntimeError(f"No desktop session appeared on asset {asset_ip}.")
+        message, detail = _describe_failure(
+            f"Asset {asset_ip}", "No desktop session appeared on the asset."
+        )
+        raise StepError(message, detail)
     payload = base64.b64encode(url.encode("utf-8")).decode("ascii")
+    # Errors are printed as one marker line: letting PowerShell throw makes the
+    # interactive runner's stderr redirect wrap every line in NativeCommandError noise.
     script = f"""
 $ErrorActionPreference = 'Stop'
-$url = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))
-$edge = @('C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe') | Where-Object {{ Test-Path -LiteralPath $_ }} | Select-Object -First 1
-if (-not $edge) {{ throw 'Microsoft Edge is not installed on the asset.' }}
-# Kiosk flags are ignored when Edge is already running.
-Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
-Start-Process -FilePath $edge -ArgumentList @('--kiosk', $url, '--edge-kiosk-type=fullscreen', '--no-first-run', '--autoplay-policy=no-user-gesture-required')
-Start-Sleep -Seconds 5
-if (-not (Get-Process msedge -ErrorAction SilentlyContinue)) {{ throw 'Edge did not stay open on the asset.' }}
-Write-Output 'ASSET_RENDERING_STARTED'
+try {{
+    $url = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))
+    $edge = @('C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe') | Where-Object {{ Test-Path -LiteralPath $_ }} | Select-Object -First 1
+    if (-not $edge) {{ throw 'Microsoft Edge is not installed on the asset.' }}
+    $started = $false
+    for ($attempt = 1; $attempt -le 2 -and -not $started; $attempt++) {{
+        # Kiosk flags are ignored when Edge is already running.
+        Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        Start-Process -FilePath $edge -ArgumentList @('--kiosk', $url, '--edge-kiosk-type=fullscreen', '--no-first-run', '--autoplay-policy=no-user-gesture-required')
+        # Edge can take a while to start on a busy VM, so wait for it instead of checking once.
+        $waitUntil = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $waitUntil -and -not (Get-Process msedge -ErrorAction SilentlyContinue)) {{ Start-Sleep -Seconds 1 }}
+        Start-Sleep -Seconds 4
+        $started = [bool](Get-Process msedge -ErrorAction SilentlyContinue)
+    }}
+    if (-not $started) {{ throw 'Edge did not stay open on the asset.' }}
+    Write-Output 'ASSET_RENDERING_STARTED'
+}} catch {{
+    Write-Output ('ASSET_RENDERING_ERROR: ' + $_.Exception.Message)
+    exit 1
+}}
 """.strip()
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     output, error, status, timed_out = _execute_proxmox_interactive_command(
         settings, asset_ip,
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        60, run_as_user=user,
+        120, run_as_user=user,
     )
-    if timed_out or status != 0 or "ASSET_RENDERING_STARTED" not in (output or ""):
-        raise RuntimeError((error or output or f"exit {status}").strip())
-    return user
+    if not timed_out and status == 0 and "ASSET_RENDERING_STARTED" in (output or ""):
+        return user
+    marker = re.search(r"ASSET_RENDERING_ERROR:\s*(.+)", output or "")
+    if marker:
+        raw = marker.group(1).strip()
+    else:
+        raw = (error or output or f"exit {status}").strip()
+        if timed_out:
+            raw = f"Timed out. {raw}"
+    message, detail = _describe_failure(f"Asset {asset_ip}", raw)
+    raise StepError(message, detail)
 
 
 def _disable_asset_setup_screen(settings, asset_ip):
@@ -1466,35 +1684,96 @@ Write-Output 'SETUP_SCREEN_DISABLED'
         60,
     )
     if timed_out or status != 0:
-        print(f"    - Could not disable the Windows setup screen on {asset_ip}: {_readable_powershell_error(error) or output}")
+        message, _detail = _describe_failure(
+            f"Asset {asset_ip}",
+            _readable_powershell_error(error) or output or ("Timed out." if timed_out else f"exit {status}"),
+        )
+        print(f"    - {message} The Windows setup screen could not be turned off; continuing.")
 
 
-def _existing_setup_emails(settings):
-    """Return test emails that already exist and must not be created again."""
-    emails = set()
-    try:
-        inventory = _load_ip_inventory()
-    except (OSError, json.JSONDecodeError):
-        inventory = {}
-    for run in inventory.get("setup_runs", []):
-        for record in run.get("assignments", []):
-            if record.get("status") == "created" and record.get("email"):
-                emails.add(record["email"].strip().lower())
+def _server_setup_emails(settings):
+    """Return the test users on the HERA server, or None when the server cannot be checked."""
     try:
         from server_cleanup import _login, _request, split_admin_credentials
         username, password = split_admin_credentials(settings.get("admin_credentials"))
         token = settings.get("admin_access_token") or _login(settings, username, password)
         settings["admin_access_token"] = token
         users = _request(settings, "GET", "/api/admin/users", token=token) or []
-        prefix = settings.get("account_email_user", "").strip().lower()
-        domain = settings.get("account_email_domain", "").strip().lower()
-        for user in users:
-            email = (user.get("email") or user.get("username") or "").strip().lower()
-            if prefix and domain and email.startswith(prefix) and email.endswith("@" + domain):
-                emails.add(email)
     except Exception as exc:
-        print(f"Could not check existing web users; a rerun may try to recreate them: {exc}")
+        message, _detail = _describe_failure("", str(exc))
+        print(f"Could not check the existing HERA users ({message}). Accounts recorded earlier are assumed to still exist.")
+        return None
+    emails = set()
+    prefix = settings.get("account_email_user", "").strip().lower()
+    domain = settings.get("account_email_domain", "").strip().lower()
+    for user in users:
+        email = (user.get("email") or user.get("username") or "").strip().lower()
+        if prefix and domain and email.startswith(prefix) and email.endswith("@" + domain):
+            emails.add(email)
     return emails
+
+
+def _live_setup_records(inventory):
+    """Accounts recorded as created and not torn down: the newest `created` record for each email."""
+    live = {}
+    for run in inventory.get("setup_runs", []):
+        if run.get("source", inventory.get("source")) != "proxmox":
+            continue
+        for record in run.get("assignments", []):
+            email = (record.get("email") or "").strip().lower()
+            if email and record.get("status") == "created":
+                live[email] = record
+    return sorted(live.values(), key=lambda record: int(record.get("counter") or 0))
+
+
+def _plan_setup_assignments(settings, client_ips, asset_ips, assets_per_client, live_records, taken_emails):
+    """Plan accounts only for clients that have none, without renumbering the existing ones.
+
+    Returns (new_clients, reused_clients, assignments, skipped_emails). Numbers already used by a live
+    account or by a user on the server are never handed out again, so adding VMs cannot shift existing
+    accounts. skipped_emails are server users without a recorded VM whose numbers fall inside the plan.
+    """
+    prefix = settings.get("account_email_user", "").strip().lower()
+    domain = settings.get("account_email_domain", "").strip().lower()
+    used_numbers = {int(record["counter"]) for record in live_records if record.get("counter")}
+    number_pattern = re.compile(rf"^{re.escape(prefix)}(\d+)@{re.escape(domain)}$")
+    for email in taken_emails:
+        match = number_pattern.match(email)
+        if match:
+            used_numbers.add(int(match.group(1)))
+
+    live_clients = {record.get("client_ip") for record in live_records}
+    new_clients = [ip for ip in client_ips if ip not in live_clients]
+    reused_clients = [ip for ip in client_ips if ip in live_clients]
+    # Prefer assets that no live account uses; with the same count as before this matches the old layout.
+    used_assets = {record.get("asset_ip") for record in live_records}
+    pool = [ip for ip in asset_ips if ip not in used_assets] or list(asset_ips)
+
+    assignments = []
+    number = 0
+    for client_index, client_ip in enumerate(new_clients):
+        for asset_index in range(assets_per_client):
+            number += 1
+            while number in used_numbers:
+                number += 1
+            asset_ip = pool[(client_index + asset_index * len(new_clients)) % len(pool)]
+            assignments.append({
+                "counter": number,
+                "client_ip": client_ip,
+                "asset_ip": asset_ip,
+                "email": f'{settings["account_email_user"]}{number}@{settings["account_email_domain"]}',
+                "asset_display_name": asset_display_name(settings, number),
+                "status": "pending",
+                "tx_certificate_uploaded": None,
+            })
+    live_numbers = {int(record["counter"]) for record in live_records if record.get("counter")}
+    highest = max((assignment["counter"] for assignment in assignments), default=0)
+    skipped_emails = sorted(
+        email for email in taken_emails
+        if (match := number_pattern.match(email))
+        and int(match.group(1)) not in live_numbers and int(match.group(1)) < highest
+    )
+    return new_clients, reused_clients, assignments, skipped_emails
 
 
 def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seconds=None, on_success=None, command_timeout=None, max_clients=None, record_setup=False):
@@ -1541,6 +1820,7 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
         for client_index in range(len(client_ips))
     ]
     setup_run = None
+    existing_emails = set()
     if record_setup:
         inventory = _load_ip_inventory()
         inventory.update({
@@ -1550,21 +1830,65 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
             "clients": [_inventory_vm(ip, settings) for ip in discovered_client_ips],
             "assets": [_inventory_vm(ip, settings) for ip in discovered_asset_ips],
         })
-        planned_assignments = []
-        counter = load_test_counter
-        for client_index, client_ip in enumerate(client_ips):
-            for asset_ip in client_assets_by_client[client_index]:
-                counter += 1
-                email = f'{settings["account_email_user"]}{counter}@{settings["account_email_domain"]}'
-                planned_assignments.append({
-                    "counter": counter,
-                    "client_ip": client_ip,
-                    "asset_ip": asset_ip,
-                    "email": email,
-                    "asset_display_name": asset_display_name(settings, counter),
-                    "status": "pending",
-                    "tx_certificate_uploaded": None,
-                })
+        if use_proxmox_agent:
+            server_emails = _server_setup_emails(settings)
+            live_records = _live_setup_records(inventory)
+            if server_emails is not None:
+                for record in live_records:
+                    if record["email"].strip().lower() not in server_emails:
+                        print(
+                            f"{record['email']} is recorded as created but no longer exists on the HERA server "
+                            "(deleted manually?). It will be created again."
+                        )
+                live_records = [r for r in live_records if r["email"].strip().lower() in server_emails]
+            live_emails = {r["email"].strip().lower() for r in live_records}
+            existing_emails = set(server_emails or ()) | live_emails
+            new_clients, reused_clients, planned_assignments, skipped_emails = _plan_setup_assignments(
+                settings, client_ips, asset_ips, client_assets_per_client, live_records, existing_emails
+            )
+            if reused_clients:
+                print(
+                    f"{len(reused_clients)} of the {len(client_ips)} selected client(s) already have an account "
+                    "and are left unchanged."
+                )
+            if skipped_emails:
+                print(
+                    "These users already exist on the HERA server without a recorded VM, so their numbers are skipped: "
+                    f"{', '.join(skipped_emails)}. Delete them in the HERA UI if they are leftovers."
+                )
+            if not new_clients:
+                print("Every selected client already has an account. There is nothing new to create.")
+                _save_ip_inventory(inventory)
+                return
+            client_ips = new_clients
+            client_assets_by_client = [
+                [a["asset_ip"] for a in planned_assignments if a["client_ip"] == client_ip]
+                for client_ip in client_ips
+            ]
+        else:
+            planned_assignments = []
+            counter = load_test_counter
+            for client_index, client_ip in enumerate(client_ips):
+                for asset_ip in client_assets_by_client[client_index]:
+                    counter += 1
+                    email = f'{settings["account_email_user"]}{counter}@{settings["account_email_domain"]}'
+                    planned_assignments.append({
+                        "counter": counter,
+                        "client_ip": client_ip,
+                        "asset_ip": asset_ip,
+                        "email": email,
+                        "asset_display_name": asset_display_name(settings, counter),
+                        "status": "pending",
+                        "tx_certificate_uploaded": None,
+                    })
+            server_emails = _server_setup_emails(settings)
+            existing_emails = set(server_emails or ())
+            for run in inventory.get("setup_runs", []):
+                for record in run.get("assignments", []):
+                    if record.get("status") == "created" and record.get("email"):
+                        existing_emails.add(record["email"].strip().lower())
+            if existing_emails:
+                print(f"Leaving {len(existing_emails)} existing account(s) in place.")
         setup_run = {
             "started_at": datetime.now(timezone.utc).isoformat(),
             "source": settings["ip_source"],
@@ -1575,9 +1899,6 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
         inventory.setdefault("setup_runs", []).append(setup_run)
         _save_ip_inventory(inventory)
         print(f"Saved ordered IP inventory and setup plan to {IP_INVENTORY_PATH}.")
-    existing_emails = _existing_setup_emails(settings) if record_setup else set()
-    if existing_emails:
-        print(f"Leaving {len(existing_emails)} existing account(s) in place.")
     setup_assignment_index = 0
     assets_processed = 0
 
@@ -1615,11 +1936,14 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
             for asset_ip in client_assets_by_client[client_index]:
                 if max_assets is not None and assets_processed >= max_assets:
                     break
+                setup_assignment = None
                 try:
-                    load_test_counter += 1
-                    setup_assignment = None
                     if setup_run is not None:
                         setup_assignment = setup_run["assignments"][setup_assignment_index]
+                        # Planned numbers can skip existing accounts, so use the planned one.
+                        load_test_counter = setup_assignment["counter"]
+                    else:
+                        load_test_counter += 1
                     setup_assignment_index += 1
                     existing_email = (setup_assignment or {}).get("email", "").strip().lower()
                     if existing_email and existing_email in existing_emails:
@@ -1658,8 +1982,11 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                             stdout, stderr, command_timeout
                         )
                     if timed_out:
-                        print("    - Windows command timed out. Closing the Hera window so teardown can continue.")
-                        print("    - The local Tauri account may not have been deleted.")
+                        message, _detail = _describe_failure(
+                            f"Client {client_ip} (asset {asset_ip})", "Timed out."
+                        )
+                        print(f"    - Failed. {message} The HERA window on the VM is being closed.")
+                        print("    - The account may be half-created or not deleted; check this VM before retrying.")
                         if use_proxmox_agent:
                             _execute_proxmox_command(
                                 settings, client_ip,
@@ -1735,22 +2062,23 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                         print(f"    - Success! (Exit Code / PID: {exit_status})")
                         assets_processed += 1
                     else:
+                        failure_text = (
+                            local_account_detail
+                            or error_output.strip()
+                            or output.strip()
+                            or f"exit {exit_status}"
+                        )
                         if setup_assignment is not None:
                             setup_assignment["status"] = "failed"
                             setup_assignment["local_account_verified"] = False
-                            setup_assignment["error"] = (
-                                local_account_detail
-                                or error_output.strip()
-                                or f"exit {exit_status}"
-                            )
+                            setup_assignment["error"] = failure_text
                             _save_ip_inventory(inventory)
-                        print(f"    - Error executing command for asset {asset_ip}.")
-                        print(f"    - Exit Code: {exit_status}")
-                        print(f"    - Stderr: {error_output}")
-                        if local_account_detail and local_account_detail not in error_output:
-                            print(f"    - Local account check: {local_account_detail}")
+                        message, _detail = _describe_failure(
+                            f"Client {client_ip} (asset {asset_ip})", failure_text
+                        )
+                        print(f"    - Failed. {message}")
                         if is_account_delete and not _account_delete_confirmed(output, error_output):
-                            print("    - Delete success marker was not returned by the client.")
+                            print("    - The HERA client did not confirm that the account was deleted.")
                         assets_processed += 1
                         print(f"  - Sleep for {sleep_seconds} seconds to let mtls recover from the previous execution.")
                         time.sleep(sleep_seconds)
@@ -1762,6 +2090,17 @@ def _execute_on_clients(get_tauri_command, settings, max_assets=None, sleep_seco
                 except StopIteration:
                     print("  - No more asset IPs available.")
                     break
+                except Exception as exc:
+                    # One failing VM must not stop the run for the remaining VMs.
+                    message, detail = _describe_exception(f"Client {client_ip} (asset {asset_ip})", exc)
+                    print(f"    - Failed. {message}")
+                    if setup_assignment is not None:
+                        setup_assignment["status"] = "failed"
+                        setup_assignment["local_account_verified"] = False
+                        setup_assignment["error"] = detail
+                        _save_ip_inventory(inventory)
+                    assets_processed += 1
+                    continue
 
         except paramiko.AuthenticationException:
             print(f"  - Authentication failed for {client_ip}. Please check credentials.")
@@ -1904,7 +2243,7 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
             _stop_proxmox_tauri_windows(settings, client_ip)
         except Exception as exc:
             cleanup_errors.append(f"Client session shutdown: {exc}")
-            print(f"    - Could not stop the client session on {client_ip}: {exc}")
+            print(f"    - {_describe_exception(f'Client {client_ip}', exc)[0]} (the HERA client could not be closed first)")
 
         web_cleanup_ok = True
         try:
@@ -1912,18 +2251,21 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
         except Exception as exc:
             web_cleanup_ok = False
             cleanup_errors.append(f"Hera API cleanup: {exc}")
-            print(f"    - Failed to erase web user or asset for {email}: {exc}")
+            print(
+                f"    - {email}: could not delete the web user/asset - {_describe_exception('', exc)[0]} "
+                f"(asset to delete manually: {display_name} at {asset_ip})"
+            )
         tx_cleanup_ok = True
         try:
             tx_result = delete_tx_certificate(settings, email)
             if tx_upload_configured(settings) and tx_result is False:
                 tx_cleanup_ok = False
                 cleanup_errors.append("TX certificate cleanup: delete or rehash failed; check the TX output.")
-                print(f"    - TX certificate cleanup failed for {email}; check the TX output.")
+                print(f"    - {email}: the TX server did not confirm that the certificate was deleted; check the TX output.")
         except Exception as exc:
             tx_cleanup_ok = False
             cleanup_errors.append(f"TX certificate cleanup: {exc}")
-            print(f"    - Failed to erase TX certificate for {email}: {exc}")
+            print(f"    - {email}: could not delete the TX certificate - {_describe_exception('', exc)[0]}")
 
         command = [
             r"C:\Program Files\hera-client\tauri-client-app.exe",
@@ -1954,7 +2296,10 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
             print(f"    - Local Tauri account delete command succeeded for {email}.")
         else:
             cleanup_errors.append(f"Local Tauri cleanup: {local_error}")
-            print(f"    - Local Tauri account delete failed or unconfirmed for {email}: {local_error}")
+            print(
+                f"    - {email}: the account in the HERA client app on {client_ip} could not be deleted "
+                f"or confirmed - {_describe_failure('', local_error)[0]}"
+            )
 
         pair_cleaned = not cleanup_errors and web_cleanup_ok and tx_cleanup_ok and local_deleted
         record["status"] = "cleaned" if pair_cleaned else "teardown_partial"
@@ -2013,7 +2358,7 @@ def _print_proxmox_teardown_summary(records, settings):
                 )
             )
             for error in record["cleanup_errors"]:
-                print(f"      - {error}")
+                print(f"      - {_friendly_cleanup_error(error)}")
     print(f"Results saved in {IP_INVENTORY_PATH}; partial assignments can be retried with teardown.")
 
 
@@ -2036,11 +2381,11 @@ def run_client_teardown(max_clients=None):
         try:
             erase_web_user_and_asset(settings, email, asset_display_name(settings, counter), asset_ip)
         except Exception as exc:
-            print(f"    - Failed to erase web user or asset for {email}: {exc}")
+            print(f"    - {email}: could not delete the web user/asset - {_describe_exception('', exc)[0]}")
         try:
             delete_tx_certificate(settings, email)
         except Exception as exc:
-            print(f"    - Failed to erase TX certificate for {email}: {exc}")
+            print(f"    - {email}: could not delete the TX certificate - {_describe_exception('', exc)[0]}")
         if settings["ip_source"] == "proxmox":
             return [
                 r"C:\Program Files\hera-client\tauri-client-app.exe",
@@ -2140,8 +2485,51 @@ def run_client_close(max_clients=None, client_ips_override=None):
                 ssh_client.close()
 
 
-def run_client_login(max_clients=None):
-    """Log clients into assets using load test settings."""
+def _login_state(record, rendering_mode):
+    """Classify a recorded login result as 'ok', 'failed' or 'not_tried'."""
+    status = record.get("login_status")
+    if not status:
+        return "not_tried"
+    if status != "connected":
+        return "failed"
+    if rendering_mode != "off" and record.get("asset_render_status") != rendering_mode:
+        return "failed"
+    return "ok"
+
+
+def _ask_login_retry_scope(records, rendering_mode):
+    """Return True to log in only the VMs that are not logged in yet (failed or new accounts)."""
+    states = [_login_state(record, rendering_mode) for record in records]
+    ok_count = states.count("ok")
+    failed_count = states.count("failed")
+    not_tried_count = states.count("not_tried")
+    if ok_count == 0 or failed_count + not_tried_count == 0:
+        return False
+    summary = f"{ok_count} VM(s) logged in correctly, {failed_count} failed"
+    if not_tried_count:
+        summary += f", {not_tried_count} not tried yet"
+    print(f"\nThe previous login run left: {summary}.")
+    print(
+        f"  1. Only the VMs that are not logged in yet ({failed_count + not_tried_count}: "
+        "failed or new) - recommended"
+    )
+    print(f"  2. All {len(records)} VMs again")
+    while True:
+        choice = input("Enter 1 or 2 (Enter = 1): ").strip()
+        if choice in ("", "1"):
+            return True
+        if choice == "2":
+            return False
+        print("Invalid input. Enter 1 or 2.")
+
+
+def run_client_login(max_clients=None, retry_failed_only=None, ask_client_limit=None):
+    """Log clients into assets using load test settings.
+
+    retry_failed_only: True skips VMs that already completed, False logs in all,
+    None asks when a previous run left both successes and failures.
+    ask_client_limit: optional callable that asks for the client count, only when it is needed.
+    """
     global load_test_counter
     load_test_counter = 0
     try:
@@ -2153,20 +2541,9 @@ def run_client_login(max_clients=None):
     if settings["ip_source"] == "proxmox":
         try:
             inventory = _load_ip_inventory()
-            setup_runs = [
-                run for run in inventory.get("setup_runs", [])
-                if run.get("source", inventory.get("source")) == "proxmox"
-            ]
-            if not setup_runs:
-                print("No Proxmox setup records found. Run client setup before login.")
-                return
-            latest_setup = setup_runs[-1]
-            records = [
-                record for record in latest_setup.get("assignments", [])
-                if record.get("status") == "created"
-            ]
+            records = _live_setup_records(inventory)
             if not records:
-                print("The latest Proxmox setup has no successfully created accounts to log in.")
+                print("There are no created accounts to log in. Run client setup (step 1) first.")
                 return
             settings["proxmox_vms_by_ip"] = {
                 vm["ip"]: {
@@ -2181,20 +2558,28 @@ def run_client_login(max_clients=None):
             print(f"Could not load the Proxmox setup manifest: {exc}")
             return
 
-        clients = list(dict.fromkeys(record.get("client_ip") for record in records if record.get("client_ip")))
-        if max_clients is not None:
-            clients = clients[:max(0, int(max_clients))]
-        selected_clients = set(clients)
-        records = [record for record in records if record.get("client_ip") in selected_clients]
-        print(
-            f"Using {len(records)} recorded account-to-client assignment(s) from "
-            f"{latest_setup.get('started_at', 'the latest setup')}."
-        )
-
         rendering_mode = settings["asset_rendering_mode"]
         if rendering_mode not in {"low", "high", "off"}:
             print("ASSET_RENDERING_MODE must be 'low', 'high' or 'off'.")
             return
+
+        if retry_failed_only is None:
+            retry_failed_only = _ask_login_retry_scope(records, rendering_mode)
+        if retry_failed_only:
+            records = [r for r in records if _login_state(r, rendering_mode) != "ok"]
+            print(
+                f"Logging in only the {len(records)} VM(s) that are not logged in yet "
+                "(the client limit is not applied)."
+            )
+        else:
+            if ask_client_limit is not None:
+                max_clients = ask_client_limit()
+            clients = list(dict.fromkeys(record.get("client_ip") for record in records if record.get("client_ip")))
+            if max_clients is not None:
+                clients = clients[:max(0, int(max_clients))]
+            selected_clients = set(clients)
+            records = [record for record in records if record.get("client_ip") in selected_clients]
+            print(f"Using {len(records)} recorded account-to-client assignment(s).")
 
         def open_rendering(record):
             if rendering_mode == "off":
@@ -2202,32 +2587,42 @@ def run_client_login(max_clients=None):
             try:
                 _open_asset_rendering(settings, record["asset_ip"])
             except Exception as exc:
+                message, detail = _describe_exception(f"Asset {record['asset_ip']}", exc)
                 record["asset_render_status"] = "failed"
-                record["asset_render_error"] = str(exc)
-                print(f"  - {rendering_mode} rendering failed on asset {record['asset_ip']}: {exc}")
+                record["asset_render_error"] = message
+                record["asset_render_detail"] = detail[:2000]
+                print(f"  - Rendering failed. {message}")
                 return False
             record["asset_render_status"] = rendering_mode
             record.pop("asset_render_error", None)
+            record.pop("asset_render_detail", None)
             print(f"  - {rendering_mode} rendering opened on asset {record['asset_ip']}.")
             return True
 
-        def attempt_login(record, retry=False):
+        def fail_login(record, subject, raw_error):
+            message, detail = _describe_failure(subject, raw_error)
+            record["login_status"] = "failed"
+            record["login_error"] = message
+            record["login_detail"] = detail[:2000]
+            record["login_finished_at"] = datetime.now(timezone.utc).isoformat()
+            print(f"  - Login failed. {message}")
+
+        def login_once(record, retry=False):
             counter = int(record["counter"])
             client_ip = record["client_ip"]
             asset_ip = record["asset_ip"]
             email = record["email"]
             label = "Retrying" if retry else "Logging in"
             print(f"\n{label} {email} on {client_ip} -> asset {asset_ip}...")
+            for stale_key in ("asset_render_status", "asset_render_error", "asset_render_detail", "login_detail"):
+                record.pop(stale_key, None)
             try:
                 account_site_ip = _desktop_tauri_account_site_address(
                     settings, client_ip, email
                 )
             except Exception as exc:
-                record["login_status"] = "failed"
-                record["login_error"] = str(exc)
-                record["login_finished_at"] = datetime.now(timezone.utc).isoformat()
+                fail_login(record, f"Client {client_ip} ({email})", str(exc))
                 _save_ip_inventory(inventory)
-                print(f"  - Login skipped: {exc}")
                 return
             _apply_client_credentials_to_asset(settings, client_ip)
             if rendering_mode != "off":
@@ -2254,24 +2649,49 @@ def run_client_login(max_clients=None):
                 print(f"  - Tauri opened and asset auto-connect was started for {email}.")
                 # HERA sometimes logs in but never starts the auto-connect; count that as a failed login.
                 if not _asset_session_user(settings, asset_ip):
-                    record["login_status"] = "failed"
-                    record["login_error"] = f"HERA did not open a session on asset {asset_ip}."
-                    print(f"  - {record['login_error']}")
+                    fail_login(
+                        record, f"Asset {asset_ip}",
+                        "HERA did not open a session on the asset.",
+                    )
                 else:
                     print(f"  - Asset session is open on {asset_ip}.")
                     open_rendering(record)
             else:
-                record["login_error"] = (error_output or output or f"exit {exit_status}").strip()
-                print(f"  - Login failed for {email}: {record['login_error']}")
+                raw_error = "Timed out." if timed_out else (error_output or output or f"exit {exit_status}")
+                fail_login(record, f"Client {client_ip} ({email})", raw_error)
             _save_ip_inventory(inventory)
 
+        def attempt_login(record, retry=False):
+            # One broken VM must never stop the run for the remaining VMs.
+            try:
+                login_once(record, retry)
+            except Exception as exc:
+                message, detail = _describe_exception(
+                    f"Client {record.get('client_ip')} ({record.get('email')})", exc
+                )
+                record["login_status"] = "failed"
+                record["login_error"] = message
+                record["login_detail"] = detail[:2000]
+                record["login_finished_at"] = datetime.now(timezone.utc).isoformat()
+                print(f"  - Login failed. {message}")
+                _save_ip_inventory(inventory)
+
+        def process(record):
+            if retry_failed_only and record.get("login_status") == "connected":
+                print(f"\nRetrying {rendering_mode} rendering on asset {record['asset_ip']}...")
+                open_rendering(record)
+                _save_ip_inventory(inventory)
+            else:
+                attempt_login(record, retry=bool(retry_failed_only and record.get("login_status")))
+
         for record in records:
-            attempt_login(record)
+            process(record)
 
         failed_logins = [r for r in records if r.get("login_status") != "connected"]
         failed_renders = [
             r for r in records
-            if r.get("login_status") == "connected" and r.get("asset_render_status") == "failed"
+            if rendering_mode != "off"
+            and r.get("login_status") == "connected" and r.get("asset_render_status") != rendering_mode
         ]
         if failed_logins or failed_renders:
             print(
@@ -2290,11 +2710,20 @@ def run_client_login(max_clients=None):
         if rendering_mode != "off":
             rendered = [r for r in connected if r.get("asset_render_status") == rendering_mode]
             print(f"Rendering summary: {len(rendered)}/{len(records)} asset(s) running {rendering_mode} rendering.")
+        problems = []
         for record in records:
             if record.get("login_status") != "connected":
-                print(f"  - Still failed: {record['client_ip']} ({record['email']}): {record.get('login_error', '')[:200]}")
+                problems.append(record.get("login_error") or f"Client {record['client_ip']}: login did not complete.")
             elif rendering_mode != "off" and record.get("asset_render_status") != rendering_mode:
-                print(f"  - Rendering failed: asset {record['asset_ip']}: {record.get('asset_render_error', '')[:200]}")
+                problems.append(record.get("asset_render_error") or f"Asset {record['asset_ip']}: rendering did not start.")
+        if problems:
+            print("\nWhat needs attention:")
+            for problem in problems:
+                print(f"  - {problem}")
+            print(
+                "\nTo log in only the VMs that need attention, run step 2 again. "
+                "It will ask whether to use only the VMs that are not logged in yet - choose 1."
+            )
         return
 
     def get_login_command(counter, asset_ip):
@@ -2321,6 +2750,8 @@ def run_client_login(max_clients=None):
             f'--mtls-port={settings["mtls_port"]} '
         )
 
+    if ask_client_limit is not None:
+        max_clients = ask_client_limit()
     try:
         _execute_on_clients(
             get_login_command,
@@ -2351,7 +2782,7 @@ def main():
         if choice == '1':
             run_client_setup(_prompt_client_limit("How many client VMs should setup run on?"))
         elif choice == '2':
-            run_client_login(_prompt_client_limit(
+            run_client_login(ask_client_limit=lambda: _prompt_client_limit(
                 "How many client VMs should log in?",
                 default=selected_client_limit,
             ))

@@ -21,7 +21,7 @@ variable "region" {
 variable "ami_id_client" {
   description = "AMI ID for client instances"
   type        = string
-  default     = "ami-0608c3f9e702b5a8e"
+  default     = "ami-0131a0a4e4b462bca" #Version3466
 }
 
 variable "ami_id_asset" {

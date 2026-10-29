@@ -134,8 +134,8 @@ def erase_web_user_and_asset(settings, email, display_name, asset_host):
                 break
             except RuntimeError as exc:
                 if attempt == 2:
+                    # The caller reports this failure once, in plain language.
                     asset_errors.append(str(exc))
-                    print(f"    - Could not delete web asset {display_name}: {exc}")
                 else:
                     time.sleep(5)
 
