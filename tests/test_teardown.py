@@ -165,6 +165,25 @@ class ProxmoxTeardownTests(unittest.TestCase):
         self.assertEqual(self.records[0]["status"], "teardown_partial")
         self.assertIn("still present", self.records[0]["cleanup_errors"][0])
 
+    def test_saved_vm_metadata_is_used_without_live_discovery(self):
+        # The inventory already has node/vmid for each client, so teardown must not re-scan Proxmox.
+        self.inventory["clients"] = [
+            {"ip": f"192.0.2.{i}", "name": f"win11-hera-{i}", "node": "pve1", "vmid": 1000 + i}
+            for i in range(1, 4)
+        ]
+        self.inventory["assets"] = []
+        self.run_teardown()
+        self.mocks["_get_target_ips"].assert_not_called()
+        self.assertEqual(self.settings["proxmox_vms_by_ip"]["192.0.2.1"]["vmid"], 1001)
+        self.assertEqual([r["status"] for r in self.records], ["cleaned"] * 3)
+
+    def test_missing_vm_metadata_falls_back_to_discovery(self):
+        self.inventory["clients"] = [
+            {"ip": "192.0.2.1", "name": "win11-hera-1", "node": "pve1", "vmid": 1001}
+        ]
+        self.run_teardown()
+        self.mocks["_get_target_ips"].assert_called_once()
+
 
 class DesktopAccountVerificationTests(unittest.TestCase):
     def test_strict_verification_reads_real_database_export(self):

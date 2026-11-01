@@ -2214,7 +2214,24 @@ def _teardown_recorded_proxmox_pairs(settings, max_clients=None):
         return True
 
     settings["ip_source"] = "proxmox"
-    _get_target_ips(settings)
+    # Reuse the VM node/vmid saved during setup instead of a slow live re-discovery.
+    saved_vms = {
+        vm["ip"]: {"name": vm.get("name", ""), "node": vm.get("node", ""), "vmid": vm.get("vmid")}
+        for vm in inventory.get("clients", []) + inventory.get("assets", [])
+        if vm.get("ip") and vm.get("node") and vm.get("vmid") is not None
+    }
+    needed_clients = {record["client_ip"] for record in selected_records}
+    if needed_clients <= set(saved_vms):
+        settings["proxmox_vms_by_ip"] = saved_vms
+    else:
+        print("Some clients are not in the saved inventory; looking them up on Proxmox...")
+        _get_target_ips(settings)
+        for ip, meta in saved_vms.items():
+            settings.setdefault("proxmox_vms_by_ip", {}).setdefault(ip, meta)
+    print(
+        f"Tearing down {len(selected_records)} account(s) on "
+        f"{len(needed_clients)} client(s)..."
+    )
     completed_clients = []
     for record in selected_records:
         email = record["email"]
